@@ -60,24 +60,35 @@
 ; limit is per process, so the server forks ceil(CONN_TARGET / per-worker cap)
 ; SO_REUSEPORT workers (1..8). A worker holds up to MAX_CONN connections on the
 ; scoring box, so this target is three workers and ~196k slots: enough that the
-; fd limit is not what ends a run (the CPU/p95 cliff comes first), for ~200 MB
-; of read buffers at 196k connections.
+; fd limit is not what ends a run (the CPU/p95 cliff comes first). A held
+; connection costs one 64-byte slot, so the whole target fits in ~13 MB.
 ; The extra event loop is free: with saturated /feed load on one pinned core,
 ; two, three and four workers cost 29, 29 and 28 us of CPU per request, since
 ; they only split the same work over the same core. Two workers were the
 ; earlier choice because they were the cheapest way to cover 130k fds; with
 ; that ceiling out of the way the worker count is purely an fd budget.
 %define CONN_TARGET         195000
-; Initial per-connection read buffer. A request line plus headers plus a
-; 500-character JSON body is under 1 KiB for every client in the benchmark
-; model, and anything larger grows on demand, so this is only a floor: at
-; 200k connections it is the difference between ~200 MB and ~400 MB.
+; Per-request read buffer. A request line plus headers plus a 500-character
+; JSON body is under 1 KiB for every client in the benchmark model, and
+; anything larger grows on demand, so this is only a floor.
+; The buffer is not owned by the connection while it is idle: it is allocated
+; when readable bytes arrive and released once the last complete request in it
+; has been answered, so a keep-alive connection waiting out its think time
+; holds no buffer at all. Measured on 20k held connections: 1153 -> 120 bytes
+; of server RSS per connection.
 %define CONN_INIT_CAP       1024
+; How many released read buffers a worker keeps for reuse. Only buffers that
+; are still CONN_INIT_CAP are pooled; a grown one goes back to the allocator.
+%define BUFPOOL_MAX         1024
 %define IDLE_TIMEOUT_MS     75000
 %define SWEEP_INTERVAL_MS   2000
 
 ; one live connection, indexed by file descriptor (CONN_ prefix: C_* is taken
-; by the db_create_post argument block below)
+; by the db_create_post argument block below).
+; The read buffer is only present while bytes are pending, so CONN_BUF cannot
+; tell a live connection from an empty slot: CONN_LAST does. It holds the
+; monotonic millisecond stamp of the last traffic (always non-zero in a running
+; process) and is zeroed when the slot is released.
 %define CONN_BUF            0
 %define CONN_LEN            8
 %define CONN_CAP            16

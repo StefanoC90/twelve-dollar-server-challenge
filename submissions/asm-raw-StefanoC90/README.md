@@ -45,7 +45,8 @@ connection slots. The worker count is only an fd budget, not a throughput knob:
 with saturated `/feed` load on one pinned core, two, three and four workers
 cost **29, 29 and 28 µs of CPU per request**, because each one just runs its
 share of the same work on the same core. Three workers put the fd ceiling
-comfortably above the point where CPU and p95 end a run.
+comfortably above the point where CPU and p95 end a run, and a held connection
+costs one 64-byte slot, so the whole target fits in ~13 MB.
 
 The merged four-worker build showed that CPU is the real wall: 125,000 users at
 91 % CPU (p95 389 ms, p99 596 ms) and a failed 130k probe at 95 % CPU on p95
@@ -87,15 +88,21 @@ status codes, error strings, trimming and the 500-character limit.
   full, the remainder is copied into a small per-connection queue and completed
   under `EPOLLOUT`. A slow or stuck client therefore costs buffer space, not the
   throughput of every other connection.
-- **Small per-connection read buffer.** It starts at 1 KiB and doubles on demand
-  up to 64 KiB, so a header larger than 1 KiB still works and only a request
-  over 64 KiB is rejected with 400. The initial size matters because it is the
-  dominant per-connection memory cost: measured at ~20k live keep-alive
-  sockets, **2.03 KB → 1.03 KB per connection** (42 MB → 23 MB RSS with two
-  workers, 27 MB with four; each worker also keeps a fixed 4 MB connection
-  table). Leftover bytes of a pipelined request are moved to the front of the
-  buffer, so keep-alive and pipelining work without re-parsing. A 2 s sweep
-  closes connections idle for 75 s.
+- **No read buffer on an idle connection.** The buffer starts at 1 KiB and
+  doubles on demand up to 64 KiB, so a header larger than 1 KiB still works and
+  only a request over 64 KiB is rejected with 400. It belongs to the request,
+  not to the connection: it is taken from a per-worker free list when the first
+  bytes of a request arrive and returned to it once the last complete request in
+  it has been answered. A keep-alive connection waiting out its think time
+  therefore holds nothing but its 64-byte slot, and the allocator is not in the
+  request path at all (the free list holds one entry in steady state). Measured
+  with 20k live keep-alive sockets: **1153 → 120 bytes of RSS per connection**
+  (22.5 MB → 2.4 MB), which is the difference between ~200 MB and ~13 MB of
+  unreclaimable memory at 196k connections on a box with no swap. Leftover bytes
+  of a pipelined request keep the buffer and are moved to the front, so
+  keep-alive and pipelining work without re-parsing. A 2 s sweep closes
+  connections idle for 75 s; it finds live slots by their timestamp, since an
+  idle connection no longer owns a buffer.
 - **One `writev`** sends the status line, headers and body together, from a
   response buffer that reserves 512 bytes of header headroom so the body is
   rendered exactly where it is sent from. `TCP_NODELAY` is set per connection.
@@ -142,6 +149,16 @@ status codes, error strings, trimming and the 500-character limit.
   `mmap_size=67108864`, plus `SQLITE_DEFAULT_WAL_SYNCHRONOUS=1` at compile time.
   Every write steps the statement to `SQLITE_DONE` (committing the implicit
   transaction) before the response is written.
+- **Group commit was measured and not taken.** A like or a post is its own
+  implicit transaction today. Batching those into one transaction per event-loop
+  batch (allowed by rule 6 as long as each response waits for the commit) was
+  costed with the real insert pattern on a copy of the seed database, 20k
+  inserts, pinned: **24.9 µs per like at one commit per insert, 15.1 at two,
+  10.9 at four, 8.8 at eight, 6.0 at 128**. Writes are 7.8 % of the requests in
+  `bench/load.js`, and one saturated worker sees a write roughly every 3 ms, so
+  a per-batch commit groups about two to five of them: that is ~10–14 µs per
+  write, i.e. **3–4 % of total CPU** — not worth deferring every write response
+  behind a commit and reworking the `EPOLLOUT` path for.
 - **No cross-request caching**: every request hits SQLite; JWT signatures are
   recomputed for every authenticated request.
 - **Hand-rolled crypto**: SHA-256 with a message schedule in registers/stack,
@@ -151,8 +168,9 @@ status codes, error strings, trimming and the 500-character limit.
   escapes and `\uXXXX` (including surrogate pairs) into a per-process user
   buffer, so the round-tripped body and character-count limit are exact.
 - **Minimal allocations**: the response, JSON and JWT buffers are allocated
-  once at startup; the request path allocates only a new connection's read
-  buffer, and only a partially written response allocates an output queue.
+  once at startup; the request path allocates nothing in steady state (the read
+  buffer comes from the per-worker free list, and only a partially written
+  response allocates an output queue).
 - Response bodies are built directly into the 512-byte-headroom buffer, so no
   intermediate serialization copies are made. Every response but the feed is
   rendered straight from `sqlite3_column_text` results; the feed copies each

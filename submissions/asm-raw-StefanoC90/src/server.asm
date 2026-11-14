@@ -147,8 +147,16 @@ rlim:            resq 2
 g_conn_cap:      resd 1
 evtmp:           resb 16
 g_wctx:          resb W_SIZE
+; 64-byte slots, 64-byte aligned: one connection never shares a cache line
+; with its neighbour, so serving fd N never pulls in fd N+1's slot.
+align 64
 conns:           resb CONN_SIZE * MAX_CONN
 evbuf:           resb 12 * MAX_EVENTS
+; Idle read buffers waiting to be reused (see conn_buf_get/conn_buf_put). A
+; worker only ever has a handful of requests in flight, so the pool stays tiny;
+; its only job is to keep the allocator out of the request path.
+bufpool:         resq BUFPOOL_MAX
+bufpool_n:       resq 1
 
 section .text
 
@@ -518,7 +526,10 @@ event_loop:
     mov rdi, r12
     call conn_process
     test eax, eax
-    jz .ev1_next
+    jnz .ev1_close
+    mov rdi, r12
+    call conn_release_buf      ; answer fully handed over: drop the read buffer
+    jmp .ev1_next
 .ev1_close:
     mov rdi, r12
     call conn_close
@@ -578,13 +589,12 @@ accept_new:
     imul rax, rax, CONN_SIZE
     lea rbx, [rel conns]
     add rbx, rax
-    mov edi, CONN_INIT_CAP
-    call malloc
-    test rax, rax
-    jz .reject
-    mov [rbx+CONN_BUF], rax
+    ; No read buffer yet: a connection that never sends a byte (an accepted
+    ; socket that is still in handshake, or a keep-alive connection between
+    ; requests) costs only this 64-byte slot.
+    mov qword [rbx+CONN_BUF], 0
     mov qword [rbx+CONN_LEN], 0
-    mov qword [rbx+CONN_CAP], CONN_INIT_CAP
+    mov qword [rbx+CONN_CAP], 0
     mov qword [rbx+CONN_OUTLEN], 0
     mov qword [rbx+CONN_OUTOFF], 0
     mov qword [rbx+CONN_OUTBUF], 0
@@ -600,14 +610,12 @@ accept_new:
     lea r10, [rel evtmp]
     syscall
     test rax, rax
-    js .reject_free
+    js .reject_slot
     mov rdi, r13
     call conn_read            ; the first request may already be waiting
     jmp .acc
-.reject_free:
-    mov rdi, [rbx+CONN_BUF]
-    call free
-    mov qword [rbx+CONN_BUF], 0
+.reject_slot:
+    mov qword [rbx+CONN_LAST], 0
 .reject:
     mov eax, SYS_close
     mov edi, r13d
@@ -640,8 +648,16 @@ conn_read:
     imul rax, rax, CONN_SIZE
     lea rbx, [rel conns]
     add rbx, rax
-    cmp qword [rbx+CONN_BUF], 0
+    cmp qword [rbx+CONN_LAST], 0
     je .out                     ; stale event for an already closed connection
+    cmp qword [rbx+CONN_BUF], 0
+    jne .read
+    call conn_buf_get
+    test rax, rax
+    jz .close                   ; out of memory: drop it rather than spin
+    mov [rbx+CONN_BUF], rax
+    mov qword [rbx+CONN_CAP], CONN_INIT_CAP
+    mov qword [rbx+CONN_LEN], 0
 .read:
     mov rdx, [rbx+CONN_CAP]
     sub rdx, [rbx+CONN_LEN]
@@ -706,6 +722,8 @@ conn_read:
     test eax, eax
     jnz .close
 .out:
+    mov rdi, r12
+    call conn_release_buf
     add rsp, 24
     pop r15
     pop r14
@@ -726,6 +744,65 @@ conn_read:
     mov r8d, 1
     call send_simple
     jmp .close
+
+; -----------------------------------------------------------------------------
+; conn_buf_get() -> rax = CONN_INIT_CAP bytes, or 0
+; conn_buf_put(rdi=buf, rsi=cap) - return a read buffer to the worker
+; A worker handles one request at a time, so the pool normally holds zero or
+; one entry and the allocator is never touched again after the first requests.
+; -----------------------------------------------------------------------------
+conn_buf_get:
+    mov rax, [rel bufpool_n]
+    test rax, rax
+    jz .fallback
+    dec rax
+    mov [rel bufpool_n], rax
+    lea rcx, [rel bufpool]
+    mov rax, [rcx+rax*8]
+    ret
+.fallback:
+    mov edi, CONN_INIT_CAP
+    jmp malloc
+
+conn_buf_put:
+    cmp rsi, CONN_INIT_CAP
+    jne free                    ; grown buffer: back to the allocator
+    mov rax, [rel bufpool_n]
+    cmp rax, BUFPOOL_MAX
+    jae free
+    lea rcx, [rel bufpool]
+    mov [rcx+rax*8], rdi
+    inc rax
+    mov [rel bufpool_n], rax
+    ret
+
+; -----------------------------------------------------------------------------
+; conn_release_buf(rdi=fd) - drop the read buffer of an idle connection
+; The buffer is only needed between the first byte of a request arriving and
+; the last byte of its answer being handed to the kernel, so a keep-alive
+; connection waiting out its think time keeps nothing. Anything still buffered
+; (a half-arrived request) or still queued for EPOLLOUT keeps the buffer.
+; -----------------------------------------------------------------------------
+conn_release_buf:
+    push rbx
+    mov eax, edi
+    imul rax, rax, CONN_SIZE
+    lea rbx, [rel conns]
+    add rbx, rax
+    cmp qword [rbx+CONN_LEN], 0
+    jne .out
+    cmp qword [rbx+CONN_OUTLEN], 0
+    jne .out
+    mov rdi, [rbx+CONN_BUF]
+    test rdi, rdi
+    jz .out
+    mov rsi, [rbx+CONN_CAP]
+    call conn_buf_put
+    mov qword [rbx+CONN_BUF], 0
+    mov qword [rbx+CONN_CAP], 0
+.out:
+    pop rbx
+    ret
 
 ; -----------------------------------------------------------------------------
 ; conn_process(rdi=fd) -> eax = 0 keep / 1 closed
@@ -903,9 +980,9 @@ conn_close:
     imul rax, rax, CONN_SIZE
     lea rbx, [rel conns]
     add rbx, rax
-    mov rdi, [rbx+CONN_BUF]
-    test rdi, rdi
-    jz .out
+    cmp qword [rbx+CONN_LAST], 0
+    je .out                     ; already closed
+    mov qword [rbx+CONN_LAST], 0
     ; No epoll_ctl(DEL) here: close() removes the descriptor from every epoll
     ; set that watches it, so the explicit deregistration was one wasted
     ; syscall per closed connection.
@@ -913,8 +990,12 @@ conn_close:
     mov edi, r12d
     syscall
     mov rdi, [rbx+CONN_BUF]
-    call free
+    test rdi, rdi
+    jz .no_in
+    mov rsi, [rbx+CONN_CAP]
+    call conn_buf_put
     mov qword [rbx+CONN_BUF], 0
+.no_in:
     mov qword [rbx+CONN_LEN], 0
     mov qword [rbx+CONN_CAP], 0
     mov rdi, [rbx+CONN_OUTBUF]
@@ -956,9 +1037,8 @@ sweep_idle:
     imul rax, rax, CONN_SIZE
     lea rbx, [rel conns]
     add rbx, rax
-    mov rax, [rbx+CONN_BUF]
-    test rax, rax
-    jz .next
+    cmp qword [rbx+CONN_LAST], 0
+    je .next
     mov rax, [rel g_now_ms]
     sub rax, [rbx+CONN_LAST]
     cmp rax, IDLE_TIMEOUT_MS
@@ -1623,7 +1703,7 @@ conn_flush:
     imul rax, rax, CONN_SIZE
     lea rbx, [rel conns]
     add rbx, rax
-    cmp qword [rbx+CONN_BUF], 0
+    cmp qword [rbx+CONN_LAST], 0
     je .out
 .flush:
     mov rdx, [rbx+CONN_OUTLEN]
