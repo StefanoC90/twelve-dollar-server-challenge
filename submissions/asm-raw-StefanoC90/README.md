@@ -31,10 +31,10 @@ Idle connections are dropped after 75 s of silence.
 One descriptor per client makes `RLIMIT_NOFILE` the direct ceiling on users, and
 that limit is per process. At startup the server raises the soft limit to the
 hard one (on the benchmark box both are 65535) and then forks **`SO_REUSEPORT`
-workers** until their per-worker connection caps add up to about 260,000
+workers** until their per-worker connection caps add up to `CONN_TARGET`
 connections (minimum one, maximum eight). Under the benchmark's
-`LimitNOFILE=65535` each worker can hold ~65,000, so that is **four workers** and
-~260,000 connections instead of 65,535.
+`LimitNOFILE=65535` each worker can hold ~65,000, so a 130,000 target is **two
+workers** and 130,046 connection slots instead of 65,535.
 Each worker also sets its own connection cap to `limit - reserve` (512 fds, or
 an eighth of the limit if smaller), so `accept()` never fails with `EMFILE` and
 the level-triggered listening socket can never spin the event loop; connections
@@ -43,14 +43,15 @@ are reaped by the kernel instead of zombifying. The workers are forked before
 the listening socket and before SQLite is opened, and each gets its own SQLite
 connection (WAL handles the cross-process locking).
 
-The 260,000 target is deliberately above what one core can serve. At ~40 µs of
-CPU per feed request a single 2.4 GHz core saturates near 130,000 users, so on
-the scoring box the CPU wall arrives before the fd wall; the extra workers exist
-so the fd cap is not the thing that fails first. They are not free: four event
-loops time-share one core, which costs about two CPU points (17 % instead of
-15 % at 28k users) with the same error rate and a similar tail (p95 0.4 ms,
-p99 1.3 ms versus 0.3/2.7 ms with two workers, within run-to-run noise). Below
-~130k the two configurations are equivalent.
+Two workers is the measured optimum on the scoring box. The four-worker build
+scored 125,000 users at 91 % CPU (p95 389 ms, p99 596 ms) and failed the 130k
+probe at 95 % CPU on p95 (579 ms): the extra event loops cost about 9 % more CPU
+per request, and that is what pushed the run into the p95 cliff. With two
+workers the same code costs ~9 % less per request, so 130k fits in the CPU
+budget. The 130,046 fd slots are enough for 130k; the `SO_REUSEPORT` hash
+imbalance rejects only a few hundred connections, inside the 1 % error budget.
+Above ~131k the fd ceiling is what fails, and a third worker would only add CPU
+without buying a passing score.
 
 ## Build and run
 
