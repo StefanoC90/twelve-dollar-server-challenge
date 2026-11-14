@@ -21,16 +21,21 @@ extern sqlite3_finalize
 extern append_bytes
 extern append_u64
 extern append_json_string
+extern mem_copy
 
 section .rodata
 sql_pragmas:
     db 'PRAGMA journal_mode=WAL;PRAGMA synchronous=NORMAL;PRAGMA foreign_keys=ON;'
     db 'PRAGMA busy_timeout=5000;PRAGMA cache_size=-1024;PRAGMA mmap_size=67108864;', 0
 sql_feed:
-    db 'SELECT p.id,p.body,p.created_at,u.username,'
-    db '(SELECT count(*) FROM likes l WHERE l.post_id=p.id) '
+    db 'SELECT p.id,p.body,p.created_at,u.username '
     db 'FROM posts p JOIN users u ON u.id=p.user_id '
     db 'ORDER BY p.id DESC LIMIT 20', 0
+; The 20 feed posts are the 20 highest ids, so the like rows for exactly those
+; posts are one contiguous slice of likes_post_id_idx. One range scan of ~80
+; index entries replaces 20 correlated count(*) subqueries.
+sql_feed_likes:
+    db 'SELECT post_id FROM likes WHERE post_id BETWEEN ? AND ?', 0
 sql_get:
     db 'SELECT p.id,p.body,p.created_at,u.username,'
     db '(SELECT count(*) FROM likes l WHERE l.post_id=p.id) '
@@ -59,6 +64,16 @@ s_likes:        db ',"like_count":'
 section .bss
 global g_sqlite_path
 g_sqlite_path: resq 1
+
+; Feed scratch, one worker process owns these (forked before SQLite is opened).
+; A row's text is copied out of SQLite before the next step() invalidates it.
+; A slot holds the largest legal row: 500 characters of UTF-8 body (<= 2000 B),
+; a 24-byte timestamp and a username (the JWT's `username`, which the spec does
+; not bound; 512 bytes covers any realistic token).
+%define FEED_ROWS   20
+%define FEED_SLOT   2560
+feed_rows:  resb FEED_ROWS * R_SIZE
+feed_arena: resb FEED_ROWS * FEED_SLOT
 
 section .text
 
@@ -106,6 +121,15 @@ db_init:
     lea rsi, [rel sql_feed]
     mov edx, -1
     lea rcx, [r12+W_STMT_FEED]
+    xor r8d, r8d
+    call sqlite3_prepare_v2
+    test eax, eax
+    jnz .fail_close
+    ; feed like counts
+    mov rdi, [r12+W_DB]
+    lea rsi, [rel sql_feed_likes]
+    mov edx, -1
+    lea rcx, [r12+W_STMT_FEEDL]
     xor r8d, r8d
     call sqlite3_prepare_v2
     test eax, eax
@@ -300,6 +324,99 @@ fill_row:
     ret
 
 ; -----------------------------------------------------------------------------
+; fill_row_copy(rdi=stmt, rsi=row, rdx=slot) -> eax = 0 ok / -1 row too large
+; Same as fill_row, but copies the three text columns into slot: SQLite's
+; column pointers die on the next step(), and the feed needs all 20 rows before
+; it can count likes and render. Slot is FEED_SLOT bytes.
+; -----------------------------------------------------------------------------
+fill_row_copy:
+    push rbp
+    mov rbp, rsp
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    sub rsp, 8
+    mov r12, rdi                ; stmt
+    mov r13, rsi                ; row
+    mov r14, rdx                ; slot cursor
+    mov rdi, r12
+    xor esi, esi
+    call sqlite3_column_int64
+    mov [r13+R_ID], rax
+    mov qword [r13+R_LIKES], 0
+    ; body
+    mov rdi, r12
+    mov esi, 1
+    call sqlite3_column_text
+    mov r15, rax
+    mov rdi, r12
+    mov esi, 1
+    call sqlite3_column_bytes
+    mov eax, eax
+    cmp rax, 2000
+    ja .fail
+    mov rbx, rax
+    mov [r13+R_BODY], r14
+    mov [r13+R_BODYLEN], rbx
+    mov rdi, r14
+    mov rsi, r15
+    mov rdx, rbx
+    call mem_copy
+    add r14, rbx
+    ; created_at
+    mov rdi, r12
+    mov esi, 2
+    call sqlite3_column_text
+    mov r15, rax
+    mov rdi, r12
+    mov esi, 2
+    call sqlite3_column_bytes
+    mov eax, eax
+    cmp rax, 40
+    ja .fail
+    mov rbx, rax
+    mov [r13+R_CREATED], r14
+    mov [r13+R_CREATEDLEN], rbx
+    mov rdi, r14
+    mov rsi, r15
+    mov rdx, rbx
+    call mem_copy
+    add r14, rbx
+    ; author
+    mov rdi, r12
+    mov esi, 3
+    call sqlite3_column_text
+    mov r15, rax
+    mov rdi, r12
+    mov esi, 3
+    call sqlite3_column_bytes
+    mov eax, eax
+    cmp rax, 512
+    ja .fail
+    mov rbx, rax
+    mov [r13+R_AUTHOR], r14
+    mov [r13+R_AUTHORLEN], rbx
+    mov rdi, r14
+    mov rsi, r15
+    mov rdx, rbx
+    call mem_copy
+    xor eax, eax
+    jmp .out
+.fail:
+    mov eax, -1
+.out:
+    add rsp, 8
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    pop rbp
+    ret
+
+; -----------------------------------------------------------------------------
 ; render_post(rdi=dst, rsi=row) -> rax = new end
 ; -----------------------------------------------------------------------------
 render_post:
@@ -377,47 +494,111 @@ db_feed:
     push r13
     push r14
     push r15
-    sub rsp, 120
+    sub rsp, 184
     mov r12, rdi
     mov [rbp-152], rsi          ; dst
     mov [rbp-160], rdx          ; cap
-    mov r13, rsi                ; p
     mov r14, [r12+W_STMT_FEED]
     mov rdi, r14
     call sqlite3_reset
-    mov rdi, r13
-    lea rsi, [rel s_posts_open]
-    mov edx, 10
-    call append_bytes
-    mov r13, rax
-    mov dword [rbp-136], 0      ; count
-.loop:
+    xor r15d, r15d              ; rows copied
+    lea rbx, [rel feed_arena]
+.row_loop:
+    cmp r15, FEED_ROWS
+    jae .rows_done
     mov rdi, r14
     call sqlite3_step
     cmp eax, SQLITE_ROW
     je .row
     cmp eax, SQLITE_DONE
-    je .done_rows
-    mov rdi, r14
-    call sqlite3_reset
-    mov rax, -1
-    jmp .out
+    je .rows_done
+    jmp .err_feed
 .row:
-    cmp dword [rbp-136], 0
-    je .no_comma
+    mov rdi, r14
+    lea rsi, [rel feed_rows]
+    imul rax, r15, R_SIZE
+    add rsi, rax
+    mov rdx, rbx
+    call fill_row_copy
+    test eax, eax
+    jnz .err_feed
+    add rbx, FEED_SLOT
+    inc r15
+    jmp .row_loop
+.rows_done:
+    ; The feed rows are the 20 highest ids, so exactly their like rows are one
+    ; contiguous range of likes_post_id_idx. Count them in place.
+    test r15, r15
+    jz .render
+    mov rbx, [r12+W_STMT_FEEDL]
+    mov rdi, rbx
+    call sqlite3_reset
+    lea rax, [rel feed_rows]
+    mov rcx, r15
+    dec rcx
+    imul rcx, R_SIZE
+    mov rdi, rbx
+    mov esi, 1
+    mov rdx, [rax+rcx+R_ID]
+    call sqlite3_bind_int64
+    lea rax, [rel feed_rows]
+    mov rdi, rbx
+    mov esi, 2
+    mov rdx, [rax+R_ID]
+    call sqlite3_bind_int64
+.like_loop:
+    mov rdi, rbx
+    call sqlite3_step
+    cmp eax, SQLITE_ROW
+    je .like_row
+    cmp eax, SQLITE_DONE
+    je .likes_done
+    jmp .err_likes
+.like_row:
+    mov rdi, rbx
+    xor esi, esi
+    call sqlite3_column_int64
+    lea rcx, [rel feed_rows]
+    xor edx, edx
+.find_row:
+    cmp rdx, r15
+    jae .like_loop
+    cmp [rcx+R_ID], rax
+    je .found
+    add rcx, R_SIZE
+    inc rdx
+    jmp .find_row
+.found:
+    inc qword [rcx+R_LIKES]
+    jmp .like_loop
+.likes_done:
+    mov rdi, rbx
+    call sqlite3_reset
+.render:
+    mov r13, [rbp-152]
+    mov rdi, r13
+    lea rsi, [rel s_posts_open]
+    mov edx, 10
+    call append_bytes
+    mov r13, rax
+    xor ebx, ebx
+.render_loop:
+    cmp rbx, r15
+    jae .render_done
+    test rbx, rbx
+    jz .no_comma
     mov byte [r13], ','
     inc r13
 .no_comma:
-    mov rdi, r14
-    lea rsi, [rbp-128]
-    call fill_row
     mov rdi, r13
-    lea rsi, [rbp-128]
+    lea rsi, [rel feed_rows]
+    imul rax, rbx, R_SIZE
+    add rsi, rax
     call render_post
     mov r13, rax
-    inc dword [rbp-136]
-    jmp .loop
-.done_rows:
+    inc rbx
+    jmp .render_loop
+.render_done:
     mov byte [r13], ']'
     mov byte [r13+1], '}'
     add r13, 2
@@ -426,8 +607,17 @@ db_feed:
     mov rax, r13
     sub rax, [rbp-152]
     jmp .out
+.err_likes:
+    mov rdi, rbx
+    call sqlite3_reset
+    mov rax, -1
+    jmp .out
+.err_feed:
+    mov rdi, r14
+    call sqlite3_reset
+    mov rax, -1
 .out:
-    add rsp, 120
+    add rsp, 184
     pop r15
     pop r14
     pop r13

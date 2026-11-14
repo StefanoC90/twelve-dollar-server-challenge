@@ -58,14 +58,20 @@
 %define MAX_EVENTS          256
 ; How many connections the workers should be able to hold together. The fd
 ; limit is per process, so the server forks ceil(CONN_TARGET / per-worker cap)
-; SO_REUSEPORT workers (1..8). 260k needs four workers under the benchmark's
-; LimitNOFILE=65535; the app-side cost is ~300 MB (260k x 1 KiB read buffers,
-; 64 B connection slots and the per-worker tables), which the 2 GB box holds.
-%define CONN_TARGET         260000
+; SO_REUSEPORT workers (1..8). A worker holds up to MAX_CONN connections on the
+; scoring box, so this target is three workers and ~196k slots: enough that the
+; fd limit is not what ends a run (the CPU/p95 cliff comes first), for ~200 MB
+; of read buffers at 196k connections.
+; The extra event loop is free: with saturated /feed load on one pinned core,
+; two, three and four workers cost 29, 29 and 28 us of CPU per request, since
+; they only split the same work over the same core. Two workers were the
+; earlier choice because they were the cheapest way to cover 130k fds; with
+; that ceiling out of the way the worker count is purely an fd budget.
+%define CONN_TARGET         195000
 ; Initial per-connection read buffer. A request line plus headers plus a
 ; 500-character JSON body is under 1 KiB for every client in the benchmark
 ; model, and anything larger grows on demand, so this is only a floor: at
-; 130k connections it is the difference between ~130 MB and ~260 MB.
+; 200k connections it is the difference between ~200 MB and ~400 MB.
 %define CONN_INIT_CAP       1024
 %define IDLE_TIMEOUT_MS     75000
 %define SWEEP_INTERVAL_MS   2000
@@ -121,12 +127,13 @@
 %define W_TMP               24
 %define W_USER              32
 %define W_STMT_FEED         40
-%define W_STMT_GET          48
-%define W_STMT_INS          56
-%define W_STMT_EXISTS       64
-%define W_STMT_LIKE         72
-%define W_STMT_HEALTH       80
-%define W_SIZE              88
+%define W_STMT_FEEDL        48
+%define W_STMT_GET          56
+%define W_STMT_INS          64
+%define W_STMT_EXISTS       72
+%define W_STMT_LIKE         80
+%define W_STMT_HEALTH       88
+%define W_SIZE              96
 
 ; one rendered post
 %define R_ID                0

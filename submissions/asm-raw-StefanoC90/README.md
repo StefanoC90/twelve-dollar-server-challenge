@@ -30,27 +30,29 @@ Idle connections are dropped after 75 s of silence.
 
 One descriptor per client makes `RLIMIT_NOFILE` the direct ceiling on users, and
 that limit is per process. At startup the server raises the soft limit to the
-hard one (on the benchmark box both are 65535) and then forks **`SO_REUSEPORT`
-workers** until their per-worker connection caps add up to about 260,000
-connections (minimum one, maximum eight). Under the benchmark's
-`LimitNOFILE=65535` each worker can hold ~65,000, so that is **four workers** and
-~260,000 connections instead of 65,535.
-Each worker also sets its own connection cap to `limit - reserve` (512 fds, or
-an eighth of the limit if smaller), so `accept()` never fails with `EMFILE` and
-the level-triggered listening socket can never spin the event loop; connections
-above the cap are accepted and closed at once. `SIGCHLD` is ignored so workers
-are reaped by the kernel instead of zombifying. The workers are forked before
-the listening socket and before SQLite is opened, and each gets its own SQLite
-connection (WAL handles the cross-process locking).
+hard one and then forks **`SO_REUSEPORT` workers** until their per-worker
+connection caps add up to `CONN_TARGET` connections (minimum one, maximum
+eight). Each worker also sets its own connection cap to `limit - reserve`
+(512 fds, or an eighth of the limit if smaller), so `accept()` never fails with
+`EMFILE` and the level-triggered listening socket can never spin the event
+loop; connections above the cap are accepted and closed at once. `SIGCHLD` is
+ignored so workers are reaped by the kernel instead of zombifying. The workers
+are forked before the listening socket and before SQLite is opened, and each
+gets its own SQLite connection (WAL handles the cross-process locking).
 
-The 260,000 target is deliberately above what one core can serve. At ~40 µs of
-CPU per feed request a single 2.4 GHz core saturates near 130,000 users, so on
-the scoring box the CPU wall arrives before the fd wall; the extra workers exist
-so the fd cap is not the thing that fails first. They are not free: four event
-loops time-share one core, which costs about two CPU points (17 % instead of
-15 % at 28k users) with the same error rate and a similar tail (p95 0.4 ms,
-p99 1.3 ms versus 0.3/2.7 ms with two workers, within run-to-run noise). Below
-~130k the two configurations are equivalent.
+`CONN_TARGET=195000` is **three workers** on the scoring box, i.e. ~196k
+connection slots. The worker count is only an fd budget, not a throughput knob:
+with saturated `/feed` load on one pinned core, two, three and four workers
+cost **29, 29 and 28 µs of CPU per request**, because each one just runs its
+share of the same work on the same core. Three workers put the fd ceiling
+comfortably above the point where CPU and p95 end a run.
+
+The merged four-worker build showed that CPU is the real wall: 125,000 users at
+91 % CPU (p95 389 ms, p99 596 ms) and a failed 130k probe at 95 % CPU on p95
+(579 ms). The two-statement feed query below cuts per-request CPU by **15 %**
+(33.3 → 28.3 µs per `/feed` request, saturated load, paired runs), which is
+what moves that cliff from ~130k to ~150k; the third worker then only has to
+keep the fd limit from being what fails a run.
 
 ## Build and run
 
@@ -97,13 +99,14 @@ status codes, error strings, trimming and the 500-character limit.
 - **One `writev`** sends the status line, headers and body together, from a
   response buffer that reserves 512 bytes of header headroom so the body is
   rendered exactly where it is sent from. `TCP_NODELAY` is set per connection.
-- **One SQLite connection per worker, prepared statements reused.** Six
-  statements are prepared once at startup (`feed`, `get post`, `insert post`,
-  `post exists`, `insert like`, `SELECT 1` for health) and reset per use.
-  Prepared statements cache query plans, not data. The amalgamation is compiled
-  with **`SQLITE_THREADSAFE=0`**: each worker is a single thread with its own
-  connection, so the per-call mutexes bought nothing; cross-process access is
-  still serialised by SQLite's file locks, as WAL requires.
+- **One SQLite connection per worker, prepared statements reused.** Seven
+  statements are prepared once at startup (`feed`, `feed like counts`, `get
+  post`, `insert post`, `post exists`, `insert like`, `SELECT 1` for health) and
+  reset per use. Prepared statements cache query plans, not data. The
+  amalgamation is compiled with **`SQLITE_THREADSAFE=0`**: each worker is a
+  single thread with its own connection, so the per-call mutexes bought nothing;
+  cross-process access is still serialised by SQLite's file locks, as WAL
+  requires.
 - **Feed ordered by `id`, not by `created_at`.** The feed is
   `ORDER BY p.id DESC LIMIT 20` instead of `ORDER BY p.created_at DESC,
   p.id DESC`. That is the same order for this dataset, and it lets SQLite scan
@@ -116,6 +119,24 @@ status codes, error strings, trimming and the 500-character limit.
   Measured with a prepared statement stepping all 20 rows and reading every
   column: **17.1 µs → 14.2 µs per feed query** (`sqlbench`, 5,000 iterations,
   pinned core).
+- **The feed's like counts are one range scan, not 20 subqueries.** The feed is
+  the 20 highest post ids, so the like rows for exactly those posts are one
+  contiguous slice of `likes_post_id_idx`. The query is now
+  `SELECT p.id,p.body,p.created_at,u.username ... ORDER BY p.id DESC LIMIT 20`
+  plus one `SELECT post_id FROM likes WHERE post_id BETWEEN ? AND ?` over
+  `[rows[n-1].id, rows[0].id]`; the counts are accumulated in assembly. This
+  replaces a correlated `(SELECT count(*) ...)` per row, i.e. 20 index probes
+  and 20 extra VDBE programs with one ~80-entry index scan. Because SQLite
+  invalidates its column pointers on the next `step()`, the 20 rows' text is
+  copied into a per-worker arena (20 slots of 2.25 KiB: 500 characters of UTF-8
+  body is at most 2,000 bytes, plus timestamp and username) before the likes
+  query runs, and rendered from there afterwards.
+  Measured end to end, byte-identical bodies, 5,000 iterations pinned:
+  **13.75 µs → 9.41 µs per feed query** (-32 %); in the real server under
+  saturated `/feed` load: **33.3 → 28.3 µs of CPU per request** (-15 %,
+  +18 % throughput, paired runs). Grouped-join likes (19.8 µs), a materialised
+  top-N CTE (58 µs), `GROUP BY post_id` (7.2 µs just for the index scan) and an
+  ids-then-range variant (10.7 µs) were all measured and rejected.
 - **SQLite settings**: `journal_mode=WAL`, `synchronous=NORMAL`,
   `busy_timeout=5000`, `cache_size=-1024` (1 MiB),
   `mmap_size=67108864`, plus `SQLITE_DEFAULT_WAL_SYNCHRONOUS=1` at compile time.
@@ -133,8 +154,10 @@ status codes, error strings, trimming and the 500-character limit.
   once at startup; the request path allocates only a new connection's read
   buffer, and only a partially written response allocates an output queue.
 - Response bodies are built directly into the 512-byte-headroom buffer, so no
-  intermediate serialization copies are made; the feed's 20 posts are rendered
-  straight from `sqlite3_column_text` results.
+  intermediate serialization copies are made. Every response but the feed is
+  rendered straight from `sqlite3_column_text` results; the feed copies each
+  row's text into the arena described above, once, and then renders the 20 rows
+  from there.
 - **One header scan, 16 bytes at a time.** The event loop locates `CRLFCRLF`
   once to decide that a request is complete and passes that offset to the
   parser; the parser used to scan the same bytes again. The scan finds each LF
