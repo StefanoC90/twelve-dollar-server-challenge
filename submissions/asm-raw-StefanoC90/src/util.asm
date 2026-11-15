@@ -28,15 +28,45 @@ global u64_parse
 
 ; -----------------------------------------------------------------------------
 ; append_bytes(rdi=dst, rsi=src, rdx=len) -> rax = dst+len
-; rep movsb has a fixed startup cost, so short copies (most of them here: the
-; JSON keys and response header fragments) use a plain byte loop instead.
+; Almost every fragment here is 4..32 bytes (JSON keys, status line, header
+; pieces, a timestamp), where both a byte loop and rep movsb are dominated by
+; per-call overhead.  Use overlapping unaligned 16-byte stores instead: for any
+; length in range the first and last 16-byte window cover the whole fragment.
 ; -----------------------------------------------------------------------------
 append_bytes:
-    mov rax, rdi
-    test rdx, rdx
-    jz .done
+    lea rax, [rdi+rdx]
+    cmp rdx, 16
+    jb .short
+    cmp rdx, 32
+    ja .long
+    movdqu xmm0, [rsi]
+    movdqu xmm1, [rsi+rdx-16]
+    movdqu [rdi], xmm0
+    movdqu [rdi+rdx-16], xmm1
+    ret
+.long:
     cmp rdx, 64
     jae .bulk
+    movdqu xmm0, [rsi]
+    movdqu xmm1, [rsi+16]
+    movdqu xmm2, [rsi+rdx-32]
+    movdqu xmm3, [rsi+rdx-16]
+    movdqu [rdi], xmm0
+    movdqu [rdi+16], xmm1
+    movdqu [rdi+rdx-32], xmm2
+    movdqu [rdi+rdx-16], xmm3
+    ret
+.short:
+    cmp rdx, 8
+    jb .micro
+    mov rcx, [rsi]
+    mov r8, [rsi+rdx-8]
+    mov [rdi], rcx
+    mov [rdi+rdx-8], r8
+    ret
+.micro:
+    test rdx, rdx
+    jz .done
     mov rcx, rdx
 .copy:
     mov r8b, [rsi]
@@ -45,19 +75,37 @@ append_bytes:
     inc rdi
     dec rcx
     jnz .copy
-    mov rax, rdi
+.done:
     ret
 .bulk:
     mov rcx, rdx
     rep movsb
-    mov rax, rdi
-.done:
     ret
 
 ; -----------------------------------------------------------------------------
 ; mem_copy(rdi=dst, rsi=src, rdx=len)
+; Same shape: the feed copies a 24-byte timestamp and a short username per row,
+; where rep movsb's startup is most of the cost.
 ; -----------------------------------------------------------------------------
 mem_copy:
+    cmp rdx, 16
+    jb .short
+    cmp rdx, 32
+    ja .bulk
+    movdqu xmm0, [rsi]
+    movdqu xmm1, [rsi+rdx-16]
+    movdqu [rdi], xmm0
+    movdqu [rdi+rdx-16], xmm1
+    ret
+.short:
+    cmp rdx, 8
+    jb .bulk
+    mov rax, [rsi]
+    mov rcx, [rsi+rdx-8]
+    mov [rdi], rax
+    mov [rdi+rdx-8], rcx
+    ret
+.bulk:
     mov rcx, rdx
     rep movsb
     ret
@@ -98,9 +146,26 @@ append_u64:
 ; append_json_string(rdi=dst, rsi=str, rdx=len) -> rax = new end
 ; Escapes quote, backslash and control bytes; everything else is copied raw.
 ; Scans 16 bytes at a time with SSE2 and copies the whole string in one go when
-; nothing needs escaping (the normal case), so long bodies are not walked byte
-; by byte. Short strings skip the scan: rep movsb would not pay for it.
+; nothing needs escaping (the normal case). A feed row is three strings and two
+; of them are short - a 24-byte timestamp and a ~18-byte username - so the
+; under-32-byte case scans one or two windows with the tail masked off instead
+; of falling back to a byte loop.
 ; -----------------------------------------------------------------------------
+
+; xmm0 = 16 input bytes, xmm3/4/5 = '"', '\', 0x1f -> eax = escape mask
+%macro SPECIAL_MASK 0
+    movdqa xmm1, xmm0
+    pcmpeqb xmm1, xmm3
+    movdqa xmm2, xmm0
+    pcmpeqb xmm2, xmm4
+    por xmm1, xmm2
+    movdqa xmm2, xmm0
+    pminub xmm2, xmm5
+    pcmpeqb xmm2, xmm0
+    por xmm1, xmm2
+    pmovmskb eax, xmm1
+%endmacro
+
 append_json_string:
     push rbp
     mov rbp, rsp
@@ -115,27 +180,20 @@ append_json_string:
     lea r14, [rsi+rdx]
     mov byte [r12], '"'
     inc r12
-    cmp rdx, 32
-    jb .loop                    ; too short to be worth scanning
     movdqa xmm3, [rel v_quote]
     movdqa xmm4, [rel v_bslash]
     movdqa xmm5, [rel v_ctl]
+    cmp rdx, 16
+    jb .scan_small
+    cmp rdx, 32
+    jb .scan_two
     mov rbx, r13
 .scan16:
     lea rcx, [rbx+16]
     cmp rcx, r14
     ja .scan_tail
     movdqu xmm0, [rbx]
-    movdqa xmm1, xmm0
-    pcmpeqb xmm1, xmm3
-    movdqa xmm2, xmm0
-    pcmpeqb xmm2, xmm4
-    por xmm1, xmm2
-    movdqa xmm2, xmm0
-    pminub xmm2, xmm5
-    pcmpeqb xmm2, xmm0
-    por xmm1, xmm2
-    pmovmskb eax, xmm1
+    SPECIAL_MASK
     test eax, eax
     jnz .loop                   ; something needs escaping: byte loop
     add rbx, 16
@@ -152,6 +210,32 @@ append_json_string:
     jb .loop
     inc rbx
     jmp .scan_tail
+.scan_small:
+    ; 0..15 bytes: one window, only the first len bytes count
+    movdqu xmm0, [r13]
+    SPECIAL_MASK
+    mov ecx, edx
+    mov r11d, -1
+    shl r11d, cl
+    not r11d
+    and eax, r11d
+    jnz .loop
+    jmp .clean
+.scan_two:
+    ; 16..31 bytes: the first window whole, the second one masked
+    movdqu xmm0, [r13]
+    SPECIAL_MASK
+    test eax, eax
+    jnz .loop
+    movdqu xmm0, [r13+16]
+    SPECIAL_MASK
+    mov ecx, edx
+    sub ecx, 16
+    mov r11d, -1
+    shl r11d, cl
+    not r11d
+    and eax, r11d
+    jnz .loop
 .clean:
     mov rdi, r12
     mov rsi, r13
@@ -385,7 +469,8 @@ find_header_end:
 
 ; -----------------------------------------------------------------------------
 ; trim_ws(rdi=ptr, rsi=len) -> rax = ptr, rdx = len
-; ASCII whitespace only.
+; ASCII whitespace only: space (0x20), or 0x09..0x0d (tab, LF, VT, FF, CR), so
+; one compare against 0x20 plus one range test covers all six.
 ; -----------------------------------------------------------------------------
 trim_ws:
     mov rax, rdi
@@ -396,17 +481,9 @@ trim_ws:
     movzx ecx, byte [rax]
     cmp cl, 0x20
     je .lead_adv
-    cmp cl, 9
-    je .lead_adv
-    cmp cl, 10
-    je .lead_adv
-    cmp cl, 13
-    je .lead_adv
-    cmp cl, 11
-    je .lead_adv
-    cmp cl, 12
-    je .lead_adv
-    jmp .tail
+    lea r8d, [rcx-9]
+    cmp r8d, 4
+    ja .tail
 .lead_adv:
     inc rax
     dec rdx
@@ -417,17 +494,9 @@ trim_ws:
     movzx ecx, byte [rax+rdx-1]
     cmp cl, 0x20
     je .tail_adv
-    cmp cl, 9
-    je .tail_adv
-    cmp cl, 10
-    je .tail_adv
-    cmp cl, 13
-    je .tail_adv
-    cmp cl, 11
-    je .tail_adv
-    cmp cl, 12
-    je .tail_adv
-    jmp .done
+    lea r8d, [rcx-9]
+    cmp r8d, 4
+    ja .done
 .tail_adv:
     dec rdx
     jmp .tail

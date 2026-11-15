@@ -89,10 +89,11 @@ status_lens:
 
 s_hdr_type: db 13,10,'Content-Type: application/json',13,10,'Content-Length: '
 s_hdr_type_len equ $ - s_hdr_type
-s_hdr_conn: db 13,10,'Connection: '
-s_hdr_conn_len equ $ - s_hdr_conn
-s_hdr_end:  db 13,10,13,10
-s_hdr_end_len equ $ - s_hdr_end
+; The tail of every response, one piece: "\r\nConnection: <v>\r\n\r\n".
+s_tail_keep:  db 13,10,'Connection: keep-alive',13,10,13,10
+s_tail_keep_len equ $ - s_tail_keep
+s_tail_close: db 13,10,'Connection: close',13,10,13,10
+s_tail_close_len equ $ - s_tail_close
 
 e_notfound:       db '{"error":"not found"}'
 e_notfound_len equ $ - e_notfound
@@ -596,7 +597,7 @@ accept_new:
     mov r8d, 4
     syscall
     mov eax, r13d
-    imul rax, rax, CONN_SIZE
+    shl rax, 6                   ; rax * CONN_SIZE (64): imul is 3 cycles, shl 1
     lea rbx, [rel conns]
     add rbx, rax
     ; No read buffer yet: a connection that never sends a byte (an accepted
@@ -655,7 +656,7 @@ conn_read:
     sub rsp, 24
     mov r12d, edi
     mov eax, r12d
-    imul rax, rax, CONN_SIZE
+    shl rax, 6                   ; rax * CONN_SIZE (64): imul is 3 cycles, shl 1
     lea rbx, [rel conns]
     add rbx, rax
     cmp qword [rbx+CONN_LAST], 0
@@ -796,7 +797,7 @@ conn_buf_put:
 conn_release_buf:
     push rbx
     mov eax, edi
-    imul rax, rax, CONN_SIZE
+    shl rax, 6                   ; rax * CONN_SIZE (64): imul is 3 cycles, shl 1
     lea rbx, [rel conns]
     add rbx, rax
     cmp qword [rbx+CONN_LEN], 0
@@ -829,7 +830,7 @@ conn_process:
     sub rsp, 200
     mov r12d, edi
     mov eax, r12d
-    imul rax, rax, CONN_SIZE
+    shl rax, 6                   ; rax * CONN_SIZE (64): imul is 3 cycles, shl 1
     lea rbx, [rel conns]
     add rbx, rax
     xor r13d, r13d              ; consumed offset
@@ -940,7 +941,7 @@ conn_grow:
     sub rsp, 8
     mov r12d, edi
     mov eax, r12d
-    imul rax, rax, CONN_SIZE
+    shl rax, 6                   ; rax * CONN_SIZE (64): imul is 3 cycles, shl 1
     lea rbx, [rel conns]
     add rbx, rax
     mov rax, [rbx+CONN_CAP]
@@ -987,7 +988,7 @@ conn_close:
     sub rsp, 8
     mov r12d, edi
     mov eax, r12d
-    imul rax, rax, CONN_SIZE
+    shl rax, 6                   ; rax * CONN_SIZE (64): imul is 3 cycles, shl 1
     lea rbx, [rel conns]
     add rbx, rax
     cmp qword [rbx+CONN_LAST], 0
@@ -1044,7 +1045,7 @@ sweep_idle:
     cmp r12d, MAX_CONN
     jae .out
     mov eax, r12d
-    imul rax, rax, CONN_SIZE
+    shl rax, 6                   ; rax * CONN_SIZE (64): imul is 3 cycles, shl 1
     lea rbx, [rel conns]
     add rbx, rax
     cmp qword [rbx+CONN_LAST], 0
@@ -1094,10 +1095,11 @@ parse_request:
     mov r13, rsi
     mov r14, rdx
     mov r15, rcx
-    mov rdi, r14
-    xor eax, eax
-    mov ecx, 9
-    rep stosq
+    ; Only the two Authorization fields need clearing: every other field of the
+    ; struct is written on every successful parse, so the 72-byte rep stosq that
+    ; used to sit here (~30 cycles of microcode) bought nothing.
+    mov qword [r14+P_AUTH], 0
+    mov qword [r14+P_AUTHLEN], 0
     test r15, r15
     js .bad
     mov rdi, r12
@@ -1495,38 +1497,51 @@ send_response:
     mov r15, rcx
     mov ebx, r8d
     mov [rbp-56], r9
-    mov rdi, r9
+    ; The header is built with fixed 16-byte stores from .rodata instead of six
+    ; append_bytes calls. Status line and Content-Type run are each followed by
+    ; the next piece, which overwrites any overhang, so they can round up to a
+    ; 16-byte boundary; the tail is last (the body starts right after it), so it
+    ; is stored at exactly its own length.
     lea rax, [rel status_ptrs]
     mov rsi, [rax+r13*8]
     lea rax, [rel status_lens]
     mov edx, [rax+r13*4]
-    call append_bytes
-    mov rdi, rax
+    movdqu xmm0, [rsi]
+    movdqu xmm1, [rsi+16]
+    movdqu xmm2, [rsi+32]
+    movdqu [r9], xmm0
+    movdqu [r9+16], xmm1
+    movdqu [r9+32], xmm2
+    lea rdi, [r9+rdx]
     lea rsi, [rel s_hdr_type]
-    mov edx, s_hdr_type_len
-    call append_bytes
-    mov rdi, rax
+    movdqu xmm0, [rsi]
+    movdqu xmm1, [rsi+16]
+    movdqu xmm2, [rsi+32]
+    movdqu xmm3, [rsi+34]
+    movdqu [rdi], xmm0
+    movdqu [rdi+16], xmm1
+    movdqu [rdi+32], xmm2
+    movdqu [rdi+34], xmm3
+    lea rdi, [rdi+s_hdr_type_len]
     mov rsi, r15
     call append_u64
-    mov rdi, rax
-    lea rsi, [rel s_hdr_conn]
-    mov edx, s_hdr_conn_len
-    call append_bytes
-    mov rdi, rax
     test ebx, ebx
-    jz .keep
-    lea rsi, [rel s_close]
-    mov edx, 5
-    jmp .conn_append
-.keep:
-    lea rsi, [rel s_keep]
-    mov edx, 10
-.conn_append:
-    call append_bytes
-    mov rdi, rax
-    lea rsi, [rel s_hdr_end]
-    mov edx, s_hdr_end_len
-    call append_bytes
+    jnz .close_tail
+    lea rsi, [rel s_tail_keep]
+    movdqu xmm0, [rsi]
+    movdqu xmm1, [rsi+12]
+    movdqu [rax], xmm0
+    movdqu [rax+12], xmm1
+    add rax, s_tail_keep_len
+    jmp .sent
+.close_tail:
+    lea rsi, [rel s_tail_close]
+    movdqu xmm0, [rsi]
+    mov rdx, [rsi+15]
+    movdqu [rax], xmm0
+    mov [rax+15], rdx
+    add rax, s_tail_close_len
+.sent:
     sub rax, [rbp-56]
     mov rdx, rax
     mov rdi, r12
@@ -1647,7 +1662,7 @@ conn_queue:
     mov r13, rdx                ; total bytes
     jz .ok
     mov eax, r12d
-    imul rax, rax, CONN_SIZE
+    shl rax, 6                   ; rax * CONN_SIZE (64): imul is 3 cycles, shl 1
     lea rbx, [rel conns]
     add rbx, rax
     cmp [rbx+CONN_OUTCAP], r13
@@ -1710,7 +1725,7 @@ conn_flush:
     sub rsp, 24
     mov r12d, edi
     mov eax, r12d
-    imul rax, rax, CONN_SIZE
+    shl rax, 6                   ; rax * CONN_SIZE (64): imul is 3 cycles, shl 1
     lea rbx, [rel conns]
     add rbx, rax
     cmp qword [rbx+CONN_LAST], 0
