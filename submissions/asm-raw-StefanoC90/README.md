@@ -15,7 +15,7 @@ and is described below.
 | C toolchain | GCC 13.3.0 (Ubuntu 24.04), used to compile SQLite and link |
 | SQLite | 3.54.1, pinned amalgamation `sqlite-amalgamation-3540100` (SHA-256 verified in `build.sh`) |
 | SQLite driver | the amalgamation's C API, called directly from assembly |
-| SQLite B-tree reads | `csrc/bt.c`, a 300-line C translation unit that is compiled together with the amalgamation (see below); the feed's like counts are read with SQLite's own B-tree cursor |
+| SQLite B-tree reads | `csrc/bt.c`, a ~600-line C translation unit compiled together with the amalgamation (see below); the feed, the like counts and single posts are read with SQLite's own B-tree cursors |
 | HTTP | hand-written HTTP/1.1 server on raw `epoll`/`socket`/`accept4`/`recv`/`writev` syscalls |
 | JWT | hand-written SHA-256, HMAC-SHA256 and base64url in assembly (no OpenSSL) |
 | JSON | hand-written validating JSON reader in assembly |
