@@ -28,6 +28,7 @@ extern mem_copy
 extern bt_open
 extern bt_begin
 extern bt_end
+extern bt_feed
 extern bt_count_likes
 
 section .rodata
@@ -692,6 +693,20 @@ db_feed:
     mov [rbp-152], rsi          ; dst
     mov [rbp-160], rdx          ; cap
     mov r14, [r12+W_STMT_FEED]
+    cmp dword [rel bt_ok], 0
+    je .sql_rows
+    ; The 20 newest posts straight off the posts/users B-trees (csrc/bt.c):
+    ; sqlite3BtreeLast + BtreePrevious instead of a VDBE row per post.
+    lea rdi, [rel feed_rows]
+    mov esi, FEED_ROWS
+    lea rdx, [rel feed_arena]
+    mov ecx, FEED_SLOT
+    call bt_feed
+    test eax, eax
+    js .sql_rows                ; a row the walk does not expect: use SQL
+    mov r15d, eax               ; rows copied
+    jmp .rows_done
+.sql_rows:
     mov rdi, r14
     call sqlite3_reset
     xor r15d, r15d              ; rows copied
@@ -743,7 +758,7 @@ db_feed:
     lea rdx, [rel feed_counts]
     call bt_count_likes
     test eax, eax
-    jnz .err_likes
+    jnz .sql_likes              ; unexpected index shape: recount with SQL
     lea rsi, [rel feed_rows]
     lea rdi, [rel feed_counts]
     xor ecx, ecx

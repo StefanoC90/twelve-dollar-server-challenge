@@ -120,8 +120,8 @@ status codes, error strings, trimming and the 500-character limit.
   statements are prepared once at startup (`feed`, `feed like counts`, `get
   post`, `insert post`, `post exists`, `insert like`, `SELECT 1` for health,
   and the pass transaction's `BEGIN`/`COMMIT`) and reset per use. Prepared
-  statements cache query plans, not data. The `feed like counts` statement is
-  only the fallback now (see the B-tree bullet below). The
+  statements cache query plans, not data. `feed` and `feed like counts` are
+  only the fallbacks now (see the B-tree bullets below). The
   amalgamation is compiled with **`SQLITE_THREADSAFE=0`**: each worker is a
   single thread with its own connection, so the per-call mutexes bought nothing;
   cross-process access is still serialised by SQLite's file locks, as WAL
@@ -191,6 +191,23 @@ status codes, error strings, trimming and the 500-character limit.
   definition with `pragma_table_info`/`pragma_index_info`, then self-tests the
   walk against `SELECT count(*)` for the 20 newest posts before enabling it, and
   a failure logs one line and leaves the server on the SQL statement.
+- **The feed rows come off the `posts`/`users` B-trees the same way.**
+  After the like counts moved to the B-tree cursor, the profile's largest
+  remaining SQLite cost was the feed query itself: one `sqlite3_step` per post
+  plus three `sqlite3_column_text`/`column_bytes` pairs per row, and a join
+  lookup through the VDBE. `bt_feed()` now walks `posts` backwards from its last
+  row (`sqlite3BtreeLast` + `sqlite3BtreePrevious`, id from
+  `sqlite3BtreeIntegerKey`) and looks up each author with
+  `sqlite3BtreeTableMoveto` on `users`, decoding the record headers itself
+  (`getvarint` for the header size and serial types, then the data area). The
+  text is copied straight into the same arena slots the SQL path fills, so the
+  renderer is unchanged. Measured on saturated `/feed` (8 interleaved 10 s
+  samples each, medians): **18.68 → 15.65 µs of CPU per request** (-16 %,
+  52k → 63k req/s). `getCellInfo` is called before each record is read: a
+  `TableMoveto` that lands exactly on the key, and `BtreeLast`, only clear
+  `info.nSize`, so `info.pPayload` would otherwise still describe the previous
+  row. The startup self-test now also compares all 20 rows field by field
+  against the SQL query and refuses the fast path on any difference.
 - **SQLite settings**: `journal_mode=WAL`, `synchronous=NORMAL`,
   `busy_timeout=5000`, `cache_size=-1024` (1 MiB),
   `mmap_size=67108864`, plus `SQLITE_DEFAULT_WAL_SYNCHRONOUS=1` at compile time.

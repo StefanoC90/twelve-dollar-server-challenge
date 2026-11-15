@@ -24,11 +24,32 @@ typedef unsigned char u8;
 
 #define MAX_ROWS 20
 
+/* One feed row, laid out exactly like the assembly's R_* fields. */
+typedef struct {
+  i64 id;
+  i64 body;
+  i64 bodylen;
+  i64 created;
+  i64 createdlen;
+  i64 author;
+  i64 authorlen;
+  i64 likes;
+} FeedRow;
+
 static Btree *bt;
 static BtCursor *cur_likes;
+static BtCursor *cur_posts;
+static BtCursor *cur_users;
 static KeyInfo *ki_likes;
 static Pgno root_likes;
+static Pgno root_posts;
+static Pgno root_users;
 static int in_pass;
+
+/* Records that spill onto overflow pages are copied here (not expected for a
+ * 500-character body, but a record can be larger than the page). */
+static u8 *spill;
+static u32 spill_cap;
 
 /* ---------------------------------------------------------------- startup */
 
@@ -128,6 +149,228 @@ static int cell_int(BtCursor *c, int ix, i64 *out) {
 
 /* ---------------------------------------------------------------- export */
 
+/* The record bytes of the cursor's current row: a pointer into the page when
+ * the whole record is local, else a copy in the spill buffer.  0 on error.
+ * getCellInfo is required: a move that lands on an exact key (TableMoveto) or
+ * at an end (Last) only clears info.nSize, it does not re-parse the cell, so
+ * info.pPayload would still describe the previous row. */
+static const u8 *record(BtCursor *c, u32 *len) {
+  u32 amt, total;
+  const u8 *p;
+  getCellInfo(c);
+  total = c->info.nPayload;
+  amt = c->info.nLocal;
+  p = c->info.pPayload;
+  if (amt >= total) {
+    *len = total;
+    return p;
+  }
+  if (total > spill_cap) {
+    sqlite3_free(spill);
+    spill_cap = total + 1024;
+    spill = sqlite3_malloc(spill_cap);
+    if (!spill) {
+      spill_cap = 0;
+      return 0;
+    }
+  }
+  if (sqlite3BtreePayload(c, 0, total, spill) != SQLITE_OK) return 0;
+  *len = total;
+  return spill;
+}
+
+/* SQLite's variable-length integer: up to 8 bytes of 7 bits, then a 9th byte
+ * of 8 bits.  Returns the bytes consumed, or 0 if it runs out of input. */
+static int getvarint(const u8 *p, u32 n, u64 *v) {
+  u64 x = 0;
+  u32 i;
+  for (i = 0; i < 9 && i < n; i++) {
+    if (i == 8) {
+      *v = (x << 8) | p[8];
+      return 9;
+    }
+    x = (x << 7) | (p[i] & 0x7f);
+    if ((p[i] & 0x80) == 0) {
+      *v = x;
+      return (int)i + 1;
+    }
+  }
+  return 0;
+}
+
+static u32 st_size(u64 t) {
+  static const u8 s[12] = {0, 1, 2, 3, 4, 6, 8, 8, 0, 0, 0, 0};
+  if (t < 12) return s[t];
+  return (u32)((t - 12) / 2);
+}
+
+/* Walks the record header of a row of posts/users and returns the requested
+ * columns.  Fields: 0 the rowid alias (NULL), 1 user_id/username,
+ * 2 body/created_at, 3 created_at.  0 ok, -1 unexpected shape. */
+typedef struct {
+  const u8 *p;
+  u32 len;   /* bytes after the header, i.e. the data area */
+  u32 hdr;   /* index of the next serial type */
+  u32 hdrsz; /* header size */
+  u32 off;   /* data offset */
+  int left;  /* serial types still unread */
+} Rec;
+
+static int rec_start(Rec *r, const u8 *p, u32 len) {
+  u64 hsz;
+  int k = getvarint(p, len, &hsz);
+  if (!k || hsz < 2 || hsz > len) return -1;
+  r->p = p;
+  r->len = len - (u32)hsz;
+  r->hdr = (u32)k;
+  r->hdrsz = (u32)hsz;
+  r->off = 0;
+  r->left = (int)hsz - k;
+  return 0;
+}
+
+static int rec_type(Rec *r, u64 *t) {
+  int k;
+  if (r->left <= 0) return -1;
+  k = getvarint(r->p + r->hdr, r->hdrsz - r->hdr, t);
+  if (!k || k > r->left) return -1;
+  r->hdr += (u32)k;
+  r->left -= k;
+  return 0;
+}
+
+/* The next field as text.  0 ok, -1 not text / out of range. */
+static int rec_text(Rec *r, const u8 **p, u32 *n) {
+  u64 t;
+  u32 sz;
+  if (rec_type(r, &t)) return -1;
+  if (t < 13 || (t & 1) == 0) return -1; /* not a text value */
+  sz = st_size(t);
+  if (r->off + sz > r->len) return -1;
+  *p = r->p + r->hdrsz + r->off;
+  *n = sz;
+  r->off += sz;
+  return 0;
+}
+
+/* The next field as a non-negative integer.  0 ok, -1 otherwise. */
+static int rec_int(Rec *r, i64 *v) {
+  u64 t, u = 0;
+  u32 sz, i;
+  const u8 *q;
+  if (rec_type(r, &t)) return -1;
+  sz = st_size(t);
+  if (t >= 8 && t <= 9) {
+    *v = (i64)(t - 8);
+    return 0;
+  }
+  if (t < 1 || t > 6) return -1;
+  if (r->off + sz > r->len) return -1;
+  q = r->p + r->hdrsz + r->off;
+  for (i = 0; i < sz; i++) u = (u << 8) | q[i];
+  r->off += sz;
+  *v = (i64)u;
+  return 0;
+}
+
+/* Skips the next field whatever its type. */
+static int rec_skip(Rec *r) {
+  u64 t;
+  u32 sz;
+  if (rec_type(r, &t)) return -1;
+  sz = st_size(t);
+  if (r->off + sz > r->len) return -1;
+  r->off += sz;
+  return 0;
+}
+
+/* Why the walk refused a row (reported by the startup self-test). */
+static int bt_why;
+static int why(int c) { bt_why = c; return -1; }
+
+/* bt_feed(rows, max, arena, slot): the `max` newest posts, newest first, with
+ * each row's body, created_at and author copied into its arena slot.
+ * Returns the row count, or -1 (the caller then runs the SQL statement). */
+int bt_feed(void *rowsv, int max, u8 *arena, int slot) {
+  FeedRow *rows = (FeedRow *)rowsv;
+  int n = 0, empty = 1, rc;
+  bt_why = 0;
+  if (!in_pass) return why(1);
+  if (max > MAX_ROWS) max = MAX_ROWS;
+  if (sqlite3BtreeLast(cur_posts, &empty) != SQLITE_OK) return why(2);
+  if (empty) return 0;
+  for (;;) {
+    i64 id = sqlite3BtreeIntegerKey(cur_posts);
+    i64 uid;
+    const u8 *body, *created, *author;
+    u32 bodylen, createdlen, authorlen, len;
+    const u8 *p;
+    Rec r;
+    u8 *dst;
+
+    p = record(cur_posts, &len);
+    if (!p || rec_start(&r, p, len) || rec_skip(&r) || rec_int(&r, &uid) ||
+        rec_text(&r, &body, &bodylen) || rec_text(&r, &created, &createdlen))
+      return why(3);
+    if (uid <= 0 || bodylen > 2000 || createdlen > 40) return why(4);
+
+    /* users row: (id NULL, username, created_at) */
+    {
+      int res = 0;
+      if (sqlite3BtreeTableMoveto(cur_users, uid, 0, &res) != SQLITE_OK || res != 0) return why(5);
+      p = record(cur_users, &len);
+      if (!p || rec_start(&r, p, len) || rec_skip(&r) || rec_text(&r, &author, &authorlen))
+        return why(6);
+      if (authorlen > 512) return why(7);
+    }
+
+    if (bodylen + createdlen + authorlen > (u32)slot) return why(8);
+    dst = arena + (size_t)n * (u32)slot;
+    rows[n].id = id;
+    rows[n].likes = 0;
+    rows[n].body = (i64)dst;
+    rows[n].bodylen = bodylen;
+    memcpy(dst, body, bodylen);
+    dst += bodylen;
+    rows[n].created = (i64)dst;
+    rows[n].createdlen = createdlen;
+    memcpy(dst, created, createdlen);
+    dst += createdlen;
+    rows[n].author = (i64)dst;
+    rows[n].authorlen = authorlen;
+    memcpy(dst, author, authorlen);
+    n++;
+    if (n >= max) break;
+    rc = sqlite3BtreePrevious(cur_posts, 0);
+    if (rc == SQLITE_DONE) break;
+    if (rc != SQLITE_OK) return why(9);
+  }
+  return n;
+}
+
+/* Opens the pass's read transaction and its cursors.  0 ok, -1 error. */
+int bt_begin(void) {
+  if (in_pass) return 0;
+  if (sqlite3BtreeBeginTrans(bt, 0, 0) != SQLITE_OK) return -1;
+  sqlite3BtreeCursorZero(cur_posts);
+  sqlite3BtreeCursorZero(cur_users);
+  sqlite3BtreeCursorZero(cur_likes);
+  if (sqlite3BtreeCursor(bt, root_posts, 0, 0, cur_posts) != SQLITE_OK ||
+      sqlite3BtreeCursor(bt, root_users, 0, 0, cur_users) != SQLITE_OK ||
+      sqlite3BtreeCursor(bt, root_likes, 0, ki_likes, cur_likes) != SQLITE_OK)
+    return -1;
+  in_pass = 1;
+  return 0;
+}
+
+/* Closes the cursors so the pass transaction can commit. */
+void bt_end(void) {
+  if (!in_pass) return;
+  in_pass = 0;
+  sqlite3BtreeCloseCursor(cur_likes);
+  sqlite3BtreeCloseCursor(cur_users);
+  sqlite3BtreeCloseCursor(cur_posts);
+}
 /* bt_count_likes(ids, n, counts): counts[i] = number of likes on ids[i].
  * ids must be strictly descending and n <= MAX_ROWS; counts is zeroed here.
  * 0 ok, -1 error, 1 unexpected cell shape. */
@@ -159,41 +402,33 @@ int bt_count_likes(const i64 *ids, int n, u32 *counts) {
   }
 }
 
-/* Opens the pass's read transaction and its cursors.  0 ok, -1 error. */
-int bt_begin(void) {
-  if (in_pass) return 0;
-  if (sqlite3BtreeBeginTrans(bt, 0, 0) != SQLITE_OK) return -1;
-  sqlite3BtreeCursorZero(cur_likes);
-  if (sqlite3BtreeCursor(bt, root_likes, 0, ki_likes, cur_likes) != SQLITE_OK) return -1;
-  in_pass = 1;
-  return 0;
-}
-
-/* Closes the cursors so the pass transaction can commit. */
-void bt_end(void) {
-  if (!in_pass) return;
-  in_pass = 0;
-  sqlite3BtreeCloseCursor(cur_likes);
-}
-
 /* Validates the schema, opens the B-tree and self-tests the walk against SQL.
  * 0 ok, -1 unsupported database (the caller keeps using SQL). */
 int bt_open(sqlite3 *db, char *err, int n) {
   sqlite3_stmt *s = 0;
   i64 ids[MAX_ROWS];
   u32 got[MAX_ROWS], want[MAX_ROWS];
-  int nid = 0, i, rc = 0;
+  static u8 test_arena[MAX_ROWS * 2560];
+  FeedRow rows[MAX_ROWS];
+  int nid = 0, i, rc = 0, nrows;
 
   if (!columns_are(db, "SELECT name FROM pragma_table_info('likes')", "user_id,post_id,created_at") ||
+      !columns_are(db, "SELECT name FROM pragma_table_info('posts')", "id,user_id,body,created_at") ||
+      !columns_are(db, "SELECT name FROM pragma_table_info('users')", "id,username,created_at") ||
       !columns_are(db, "SELECT name FROM pragma_index_info('likes_post_id_idx')", "post_id")) {
-    snprintf(err, n, "unexpected likes schema");
+    snprintf(err, n, "unexpected schema");
     return -1;
   }
   bt = db->aDb[0].pBt;
   root_likes = rootpage(db, "likes_post_id_idx");
+  root_posts = rootpage(db, "posts");
+  root_users = rootpage(db, "users");
   ki_likes = keyinfo(db, 1, 1, 0);
   cur_likes = sqlite3_malloc(sqlite3BtreeCursorSize());
-  if (!bt || !root_likes || !ki_likes || !cur_likes) {
+  cur_posts = sqlite3_malloc(sqlite3BtreeCursorSize());
+  cur_users = sqlite3_malloc(sqlite3BtreeCursorSize());
+  if (!bt || !root_likes || !root_posts || !root_users || !ki_likes || !cur_likes ||
+      !cur_posts || !cur_users) {
     snprintf(err, n, "btree setup failed");
     return -1;
   }
@@ -233,6 +468,53 @@ int bt_open(sqlite3 *db, char *err, int n) {
       snprintf(err, n, "self-test: post %lld has %u likes, walk says %u", ids[i], want[i], got[i]);
       rc = -1;
       goto out;
+    }
+  }
+  sqlite3_finalize(s);
+  s = 0;
+
+  /* Self-test the row walk the same way, field by field. */
+  nrows = bt_feed(rows, MAX_ROWS, test_arena, 2560);
+  if (nrows != nid) {
+    snprintf(err, n, "self-test: walk returned %d (step %d), SQL %d", nrows, bt_why, nid);
+    rc = -1;
+    goto out;
+  }
+  if (sqlite3_prepare_v2(db, "SELECT p.id,p.body,p.created_at,u.username "
+                             "FROM posts p JOIN users u ON u.id=p.user_id "
+                             "ORDER BY p.id DESC LIMIT 20", -1, &s, 0)) {
+    rc = -1;
+    goto out;
+  }
+  for (i = 0; i < nrows; i++) {
+    int col;
+    if (sqlite3_step(s) != SQLITE_ROW) {
+      rc = -1;
+      goto out;
+    }
+    for (col = 0; col < 4; col++) {
+      const u8 *wp;
+      i64 wantlen;
+      const u8 *gp;
+      if (col == 0) {
+        if (sqlite3_column_int64(s, 0) != rows[i].id) {
+          snprintf(err, n, "self-test: row %d id differs", i);
+          rc = -1;
+          goto out;
+        }
+        continue;
+      }
+      wp = sqlite3_column_text(s, col);
+      wantlen = sqlite3_column_bytes(s, col);
+      gp = (const u8 *)(col == 1 ? rows[i].body : col == 2 ? rows[i].created : rows[i].author);
+      if (wantlen != (col == 1 ? rows[i].bodylen : col == 2 ? rows[i].createdlen : rows[i].authorlen) ||
+          memcmp(wp, gp, (size_t)wantlen) != 0) {
+        snprintf(err, n, "self-test: row %d column %d differs (%d bytes, walk %d)",
+                 i, col, (int)wantlen,
+                 (int)(col == 1 ? rows[i].bodylen : col == 2 ? rows[i].createdlen : rows[i].authorlen));
+        rc = -1;
+        goto out;
+      }
     }
   }
 out:
