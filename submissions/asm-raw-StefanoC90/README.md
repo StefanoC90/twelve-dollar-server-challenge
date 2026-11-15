@@ -2,7 +2,9 @@
 
 A from-scratch implementation of the feed API in **hand-written x86-64 Linux
 assembly** (NASM), with no web framework and no HTTP/JSON/JWT library. SQLite is
-used in-process through its C API.
+used in-process through its C API; the one C file of the project is the B-tree
+read path (`csrc/bt.c`), which has to see SQLite's internal cursor structures
+and is described below.
 
 ## Stack and versions
 
@@ -10,9 +12,10 @@ used in-process through its C API.
 |---|---|
 | Language | x86-64 assembly (NASM syntax), System V ABI |
 | Assembler | NASM 2.16.01 (`apt install nasm`) |
-| C toolchain | GCC 13.3.0 (Ubuntu 24.04), used only to compile SQLite and link |
+| C toolchain | GCC 13.3.0 (Ubuntu 24.04), used to compile SQLite and link |
 | SQLite | 3.54.1, pinned amalgamation `sqlite-amalgamation-3540100` (SHA-256 verified in `build.sh`) |
 | SQLite driver | the amalgamation's C API, called directly from assembly |
+| SQLite B-tree reads | `csrc/bt.c`, a 300-line C translation unit that is compiled together with the amalgamation (see below); the feed's like counts are read with SQLite's own B-tree cursor |
 | HTTP | hand-written HTTP/1.1 server on raw `epoll`/`socket`/`accept4`/`recv`/`writev` syscalls |
 | JWT | hand-written SHA-256, HMAC-SHA256 and base64url in assembly (no OpenSSL) |
 | JSON | hand-written validating JSON reader in assembly |
@@ -64,8 +67,15 @@ keep the fd limit from being what fails a run.
 ```
 
 Only those four environment variables are read. `build.sh` compiles the pinned
-SQLite amalgamation with the server's flags and links a static, non-PIE binary;
-no build output is committed (`.gitignore` covers `bin/` and `vendor/`).
+SQLite amalgamation (through `csrc/bt.c`, which `#include`s it) with the
+server's flags and links a static, non-PIE binary; no build output is committed
+(`.gitignore` covers `bin/` and `vendor/`).
+
+Sources: `src/*.asm` is the whole server — HTTP, JSON, JWT, SQLite calls,
+routing. `csrc/bt.c` is the only C of the project besides SQLite itself, and it
+exists because the B-tree cursor API and the page layout are internal to
+SQLite: including the amalgamation lets the compiler use the real struct
+definitions instead of offsets copied by hand.
 
 ## Endpoints
 
@@ -106,10 +116,12 @@ status codes, error strings, trimming and the 500-character limit.
 - **One `writev`** sends the status line, headers and body together, from a
   response buffer that reserves 512 bytes of header headroom so the body is
   rendered exactly where it is sent from. `TCP_NODELAY` is set per connection.
-- **One SQLite connection per worker, prepared statements reused.** Seven
+- **One SQLite connection per worker, prepared statements reused.** Nine
   statements are prepared once at startup (`feed`, `feed like counts`, `get
-  post`, `insert post`, `post exists`, `insert like`, `SELECT 1` for health) and
-  reset per use. Prepared statements cache query plans, not data. The
+  post`, `insert post`, `post exists`, `insert like`, `SELECT 1` for health,
+  and the pass transaction's `BEGIN`/`COMMIT`) and reset per use. Prepared
+  statements cache query plans, not data. The `feed like counts` statement is
+  only the fallback now (see the B-tree bullet below). The
   amalgamation is compiled with **`SQLITE_THREADSAFE=0`**: each worker is a
   single thread with its own connection, so the per-call mutexes bought nothing;
   cross-process access is still serialised by SQLite's file locks, as WAL
@@ -160,6 +172,25 @@ status codes, error strings, trimming and the 500-character limit.
   +18 % throughput, paired runs). Grouped-join likes (19.8 µs), a materialised
   top-N CTE (58 µs), `GROUP BY post_id` (7.2 µs just for the index scan) and an
   ids-then-range variant (10.7 µs) were all measured and rejected.
+- **The like counts are read off the index with SQLite's B-tree cursor.**
+  `strace`-free sampling of a saturated worker showed the SQL version of the
+  step above still spending **26 % of a `/feed` request** inside that one
+  statement: 81 `sqlite3_step` calls (one per index entry plus the terminator)
+  and 80 `sqlite3_column_int64` calls, each paying the VDBE's per-row overhead.
+  `csrc/bt.c` now seeks `likes_post_id_idx` once with
+  `sqlite3BtreeIndexMoveto`, then walks it with `sqlite3BtreeNext`, decoding the
+  two varints of each leaf cell in place (`findCell` + a 1-byte record header)
+  and counting per post id. One call for the whole request, no VDBE. Measured on
+  saturated `/feed` (6 interleaved 10 s samples each, medians): **24.33 → 18.90
+  µs of CPU per request** (-22 %, 40k → 52k req/s). Skipping the counting
+  entirely was worth 25.3 → 18.9 µs, so this recovers almost all of it.
+  The walk is inside the pass transaction (`sqlite3BtreeBeginTrans` when the
+  pass's `BEGIN` runs, cursors closed before its `COMMIT`), so it still sees
+  every committed write. Because it depends on SQLite internals, it is not
+  trusted blindly: `bt_open` checks the `likes` column order and the index
+  definition with `pragma_table_info`/`pragma_index_info`, then self-tests the
+  walk against `SELECT count(*)` for the 20 newest posts before enabling it, and
+  a failure logs one line and leaves the server on the SQL statement.
 - **SQLite settings**: `journal_mode=WAL`, `synchronous=NORMAL`,
   `busy_timeout=5000`, `cache_size=-1024` (1 MiB),
   `mmap_size=67108864`, plus `SQLITE_DEFAULT_WAL_SYNCHRONOUS=1` at compile time.

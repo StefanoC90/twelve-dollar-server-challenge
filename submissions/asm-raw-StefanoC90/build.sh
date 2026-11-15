@@ -26,10 +26,12 @@ SQLITE_FLAGS="-DSQLITE_THREADSAFE=0 -DSQLITE_DEFAULT_MEMSTATUS=0 -DSQLITE_DQS=0
   -DSQLITE_MAX_EXPR_DEPTH=0 -DSQLITE_USE_ALLOCA -DHAVE_USLEEP=1 -DHAVE_FDATASYNC=1
   -DSQLITE_DEFAULT_WAL_SYNCHRONOUS=1 -DSQLITE_DEFAULT_CACHE_SIZE=-1024"
 
-if [ ! -f bin/sqlite3.o ] || [ "$SQLITE_FLAGS" != "$(cat bin/.sqlite-flags 2>/dev/null)" ] ||
-   [ "vendor/$SQLITE/sqlite3.c" -nt bin/sqlite3.o ]; then
-  gcc -O2 -march=x86-64 -fno-plt -w $SQLITE_FLAGS -I"vendor/$SQLITE" \
-    -c "vendor/$SQLITE/sqlite3.c" -o bin/sqlite3.o
+if [ ! -f bin/bt.o ] || [ "$SQLITE_FLAGS" != "$(cat bin/.sqlite-flags 2>/dev/null)" ] ||
+   [ "vendor/$SQLITE/sqlite3.c" -nt bin/bt.o ] || [ csrc/bt.c -nt bin/bt.o ]; then
+  # csrc/bt.c #includes the amalgamation: it is the same build, with the B-tree
+  # cursor API visible to the feed's like-count walk (see csrc/bt.c).
+  gcc -O2 -march=x86-64 -fno-plt -w $SQLITE_FLAGS -I"vendor/$SQLITE" -Icsrc \
+    -c csrc/bt.c -o bin/bt.o
   printf '%s' "$SQLITE_FLAGS" > bin/.sqlite-flags
 fi
 
@@ -38,7 +40,7 @@ for f in server util json crypto jwt db; do
 done
 
 gcc -no-pie -o bin/server \
-  bin/server.o bin/util.o bin/json.o bin/crypto.o bin/jwt.o bin/db.o bin/sqlite3.o \
+  bin/server.o bin/util.o bin/json.o bin/crypto.o bin/jwt.o bin/db.o bin/bt.o \
   -lpthread -lm
 
 echo "built bin/server"

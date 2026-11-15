@@ -17,11 +17,18 @@ extern sqlite3_column_text
 extern sqlite3_column_bytes
 extern sqlite3_changes
 extern sqlite3_finalize
+extern strlen
 
 extern append_bytes
 extern append_u64
 extern append_json_string
 extern mem_copy
+
+; csrc/bt.c: the likes index walk over SQLite's B-tree cursor
+extern bt_open
+extern bt_begin
+extern bt_end
+extern bt_count_likes
 
 section .rodata
 sql_pragmas:
@@ -53,6 +60,11 @@ sql_begin:
     db 'BEGIN', 0
 sql_commit:
     db 'COMMIT', 0
+s_bt_fail:
+    db 'bt: no B-tree feed path, using SQL: '
+s_bt_fail_len equ $ - s_bt_fail
+s_nl:
+    db 10
 
 s_open_brace:   db '{'
 s_close_brace:  db '}'
@@ -74,6 +86,16 @@ g_sqlite_path: resq 1
 txn_begin:  resq 1
 txn_commit: resq 1
 txn_open:   resd 1
+
+; 1 once csrc/bt.c has validated the schema and self-tested its index walk; 0
+; keeps the feed on the SQL likes statement.
+bt_ok:      resd 1
+
+; Startup-only message buffer for bt_open, and the feed's ids (descending) and
+; their like counts for the B-tree walk.
+bt_errbuf:   resb 128
+feed_ids:    resq 20
+feed_counts: resd 20
 
 ; Feed scratch, one worker process owns these (forked before SQLite is opened).
 ; A row's text is copied out of SQLite before the next step() invalidates it.
@@ -208,6 +230,36 @@ db_init:
     call sqlite3_prepare_v2
     test eax, eax
     jnz .fail_close
+    ; The B-tree read path validates the schema and self-tests its walk against
+    ; SQL. It failing is not fatal: the feed falls back to the SQL statement.
+    mov rdi, [r12+W_DB]
+    lea rsi, [rel bt_errbuf]
+    mov edx, 128
+    call bt_open
+    test eax, eax
+    jnz .bt_fallback
+    mov dword [rel bt_ok], 1
+    xor eax, eax
+    jmp .done
+.bt_fallback:
+    mov dword [rel bt_ok], 0
+    mov eax, SYS_write
+    mov edi, 2
+    lea rsi, [rel s_bt_fail]
+    mov edx, s_bt_fail_len
+    syscall
+    lea rdi, [rel bt_errbuf]
+    call strlen
+    mov edx, eax
+    mov eax, SYS_write
+    mov edi, 2
+    lea rsi, [rel bt_errbuf]
+    syscall
+    mov eax, SYS_write
+    mov edi, 2
+    lea rsi, [rel s_nl]
+    mov edx, 1
+    syscall
     xor eax, eax
     jmp .done
 .fail_close:
@@ -309,10 +361,24 @@ db_begin:
     mov rdi, [rel txn_begin]
     call sqlite3_step
     cmp eax, SQLITE_DONE
+    jne .fail
+    ; The feed reads the likes index through a B-tree cursor (csrc/bt.c), which
+    ; needs the pass transaction open on the btree, not just the SQL statement.
+    cmp dword [rel bt_ok], 0
     je .done
+    call bt_begin
+    test eax, eax
+    jz .done
+    ; A btree transaction could not start: keep serving, but from SQL.
+    mov dword [rel bt_ok], 0
+.fail:
     ; could not begin: leave the reads in autocommit rather than fail requests
     mov dword [rel txn_open], 0
-    mov rdi, [rel txn_begin]
+    mov rdi, [rel txn_commit]
+    call sqlite3_reset
+    mov rdi, [rel txn_commit]
+    call sqlite3_step
+    mov rdi, [rel txn_commit]
     call sqlite3_reset
 .done:
     pop r11
@@ -339,6 +405,11 @@ db_end:
     cmp dword [rel txn_open], 0
     je .done
     mov dword [rel txn_open], 0
+    ; SQLite will not commit with a cursor still open on the btree.
+    cmp dword [rel bt_ok], 0
+    je .commit
+    call bt_end
+.commit:
     mov rdi, [rel txn_commit]
     call sqlite3_reset
     mov rdi, [rel txn_commit]
@@ -638,7 +709,8 @@ db_feed:
 .row:
     mov rdi, r14
     lea rsi, [rel feed_rows]
-    imul rax, r15, R_SIZE
+    mov rax, r15
+    shl rax, 6                   ; * R_SIZE (64)
     add rsi, rax
     mov rdx, rbx
     call fill_row_copy
@@ -652,13 +724,45 @@ db_feed:
     ; contiguous range of likes_post_id_idx. Count them in place.
     test r15, r15
     jz .render
+    cmp dword [rel bt_ok], 0
+    je .sql_likes
+    ; Walk the index with SQLite's B-tree cursor (csrc/bt.c): one seek plus one
+    ; pass over the entries, instead of a VDBE step and a column read per row.
+    lea rsi, [rel feed_rows]
+    lea rdi, [rel feed_ids]
+    xor ecx, ecx
+.gather_ids:
+    mov rax, [rsi+R_ID]
+    mov [rdi+rcx*8], rax
+    add rsi, R_SIZE
+    inc rcx
+    cmp rcx, r15
+    jb .gather_ids
+    lea rdi, [rel feed_ids]
+    mov esi, r15d
+    lea rdx, [rel feed_counts]
+    call bt_count_likes
+    test eax, eax
+    jnz .err_likes
+    lea rsi, [rel feed_rows]
+    lea rdi, [rel feed_counts]
+    xor ecx, ecx
+.store_counts:
+    mov eax, [rdi+rcx*4]
+    mov [rsi+R_LIKES], rax
+    add rsi, R_SIZE
+    inc rcx
+    cmp rcx, r15
+    jb .store_counts
+    jmp .render
+.sql_likes:
     mov rbx, [r12+W_STMT_FEEDL]
     mov rdi, rbx
     call sqlite3_reset
     lea rax, [rel feed_rows]
     mov rcx, r15
     dec rcx
-    imul rcx, R_SIZE
+    shl rcx, 6                   ; * R_SIZE (64)
     mov rdi, rbx
     mov esi, 1
     mov rdx, [rax+rcx+R_ID]
@@ -668,6 +772,12 @@ db_feed:
     mov esi, 2
     mov rdx, [rax+R_ID]
     call sqlite3_bind_int64
+    ; likes come back in ascending post_id order and the feed rows are in
+    ; descending id order, so walk the feed rows downwards once instead of
+    ; rescanning all of them for every like row.
+    mov rax, r15
+    dec rax
+    mov [rbp-168], rax
 .like_loop:
     mov rdi, rbx
     call sqlite3_step
@@ -680,17 +790,19 @@ db_feed:
     mov rdi, rbx
     xor esi, esi
     call sqlite3_column_int64
+.merge:
+    mov rdx, [rbp-168]
+    test rdx, rdx
+    js .like_loop                ; below the lowest feed id: no match possible
     lea rcx, [rel feed_rows]
-    xor edx, edx
-.find_row:
-    cmp rdx, r15
-    jae .like_loop
+    shl rdx, 6                   ; * R_SIZE (64)
+    add rcx, rdx
     cmp [rcx+R_ID], rax
-    je .found
-    add rcx, R_SIZE
-    inc rdx
-    jmp .find_row
-.found:
+    jae .merge_done
+    dec qword [rbp-168]
+    jmp .merge
+.merge_done:
+    jne .like_loop               ; feed id > this post id: a gap, no match
     inc qword [rcx+R_LIKES]
     jmp .like_loop
 .likes_done:
@@ -714,7 +826,8 @@ db_feed:
 .no_comma:
     mov rdi, r13
     lea rsi, [rel feed_rows]
-    imul rax, rbx, R_SIZE
+    mov rax, rbx
+    shl rax, 6                   ; * R_SIZE (64)
     add rsi, rax
     call render_post
     mov r13, rax
