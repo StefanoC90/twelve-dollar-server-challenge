@@ -209,8 +209,15 @@ status codes, error strings, trimming and the 500-character limit.
   row. The startup self-test now also compares all 20 rows field by field
   against the SQL query and refuses the fast path on any difference.
 - **SQLite settings**: `journal_mode=WAL`, `synchronous=NORMAL`,
-  `busy_timeout=5000`, `cache_size=-1024` (1 MiB),
-  `mmap_size=67108864`, plus `SQLITE_DEFAULT_WAL_SYNCHRONOUS=1` at compile time.
+  `busy_timeout=5000`, `cache_size=-16384` (16 MiB), `mmap_size=0`, plus
+  `SQLITE_DEFAULT_WAL_SYNCHRONOUS=1` at compile time.
+  The page cache is the read path: with the B-tree walks touching a handful of
+  `posts`/`users` pages, a 16 MiB cache measured **15.65 → 15.38 µs per request**
+  against the previous 1 MiB cache with a 64 MiB `mmap` window, and mapping the
+  whole 249 MB database instead (`mmap_size=402653184`) was slower still
+  (15.68 µs) — every mapped page is a fault on first touch and the OS page cache
+  is not SQLite's. A 64 MiB page cache measured the same as 16 MiB (15.40 vs
+  15.44), so 16 MiB is what is configured.
   Every write steps the statement to `SQLITE_DONE` (committing the implicit
   transaction) before the response is written.
 - **Group commit was measured and not taken.** A like or a post is its own

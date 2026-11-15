@@ -34,7 +34,7 @@ extern bt_count_likes
 section .rodata
 sql_pragmas:
     db 'PRAGMA journal_mode=WAL;PRAGMA synchronous=NORMAL;PRAGMA foreign_keys=ON;'
-    db 'PRAGMA busy_timeout=5000;PRAGMA cache_size=-1024;PRAGMA mmap_size=67108864;', 0
+    db 'PRAGMA busy_timeout=5000;PRAGMA cache_size=-16384;PRAGMA mmap_size=0;', 0
 sql_feed:
     db 'SELECT p.id,p.body,p.created_at,u.username '
     db 'FROM posts p JOIN users u ON u.id=p.user_id '
