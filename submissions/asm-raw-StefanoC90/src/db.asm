@@ -29,6 +29,7 @@ extern bt_open
 extern bt_begin
 extern bt_end
 extern bt_feed
+extern bt_post
 extern bt_count_likes
 
 section .rodata
@@ -894,6 +895,19 @@ db_get_post:
     mov [rbp-152], rdx          ; dst
     mov [rbp-160], rcx          ; cap
     mov r14, [r12+W_STMT_GET]
+    cmp dword [rel bt_ok], 0
+    je .sql
+    ; One post straight off the posts/users B-trees and the likes index
+    ; (csrc/bt.c): no VDBE program, no bound statement.
+    mov rdi, r13
+    lea rsi, [rbp-128]
+    call bt_post
+    test eax, eax
+    jz .render
+    cmp eax, 1
+    je .not_found
+    ; a row the walk does not expect: use the SQL statement
+.sql:
     mov rdi, r14
     call sqlite3_reset
     mov rdi, r14
@@ -914,6 +928,7 @@ db_get_post:
     mov rdi, r14
     lea rsi, [rbp-128]
     call fill_row
+.render:
     mov rdi, [rbp-152]
     lea rsi, [rel s_post_open]
     mov edx, 8

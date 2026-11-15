@@ -348,6 +348,62 @@ int bt_feed(void *rowsv, int max, u8 *arena, int slot) {
   return n;
 }
 
+/* Defined below; bt_post counts one post's likes with it. */
+int bt_count_likes(const i64 *ids, int n, u32 *counts);
+
+/* bt_post(id, row): one post by id, with the same FeedRow layout the feed
+ * uses and its text copied into the module's one-row slot.
+ * 0 found, 1 no such post, -1 fall back to SQL. */
+static u8 one_slot[2560];
+
+int bt_post(i64 id, void *rowv) {
+  FeedRow *row = (FeedRow *)rowv;
+  int res = 0, rc;
+  u32 len, bodylen, createdlen, authorlen;
+  const u8 *p, *body, *created, *author;
+  i64 uid;
+  u32 cnt = 0;
+  Rec r;
+  u8 *dst = one_slot;
+
+  if (!in_pass) return -1;
+  if (sqlite3BtreeTableMoveto(cur_posts, id, 0, &res) != SQLITE_OK) return -1;
+  if (res != 0) return 1;
+  p = record(cur_posts, &len);
+  if (!p || rec_start(&r, p, len) || rec_skip(&r) || rec_int(&r, &uid) ||
+      rec_text(&r, &body, &bodylen) || rec_text(&r, &created, &createdlen))
+    return -1;
+  if (uid <= 0 || bodylen > 2000 || createdlen > 40) return -1;
+
+  {
+    int res2 = 0;
+    if (sqlite3BtreeTableMoveto(cur_users, uid, 0, &res2) != SQLITE_OK || res2 != 0) return -1;
+    p = record(cur_users, &len);
+    if (!p || rec_start(&r, p, len) || rec_skip(&r) || rec_text(&r, &author, &authorlen))
+      return -1;
+    if (authorlen > 512) return -1;
+  }
+
+  rc = bt_count_likes(&id, 1, &cnt);
+  if (rc) return -1;
+
+  if (bodylen + createdlen + authorlen > (u32)sizeof one_slot) return -1;
+  row->id = id;
+  row->likes = cnt;
+  row->body = (i64)dst;
+  row->bodylen = bodylen;
+  memcpy(dst, body, bodylen);
+  dst += bodylen;
+  row->created = (i64)dst;
+  row->createdlen = createdlen;
+  memcpy(dst, created, createdlen);
+  dst += createdlen;
+  row->author = (i64)dst;
+  row->authorlen = authorlen;
+  memcpy(dst, author, authorlen);
+  return 0;
+}
+
 /* Opens the pass's read transaction and its cursors.  0 ok, -1 error. */
 int bt_begin(void) {
   if (in_pass) return 0;
@@ -516,6 +572,61 @@ int bt_open(sqlite3 *db, char *err, int n) {
         goto out;
       }
     }
+  }
+
+  /* And the single-post path, against the get statement, same 20 ids. */
+  sqlite3_finalize(s);
+  s = 0;
+  if (sqlite3_prepare_v2(db, "SELECT p.id,p.body,p.created_at,u.username,"
+                             "(SELECT count(*) FROM likes l WHERE l.post_id=p.id) "
+                             "FROM posts p JOIN users u ON u.id=p.user_id WHERE p.id=?1",
+                         -1, &s, 0)) {
+    rc = -1;
+    goto out;
+  }
+  for (i = 0; i < nid; i++) {
+    FeedRow got1;
+    int col;
+    if (sqlite3_bind_int64(s, 1, ids[i]) || sqlite3_step(s) != SQLITE_ROW) {
+      rc = -1;
+      goto out;
+    }
+    if (bt_post(ids[i], &got1) != 0) {
+      snprintf(err, n, "self-test: post %lld not found by the walk", ids[i]);
+      rc = -1;
+      goto out;
+    }
+    for (col = 0; col < 5; col++) {
+      const u8 *gp;
+      const u8 *wp;
+      i64 wantlen, gotlen;
+      if (col == 0) {
+        if (sqlite3_column_int64(s, 0) != got1.id) {
+          snprintf(err, n, "self-test: post %lld id differs", ids[i]);
+          rc = -1;
+          goto out;
+        }
+        continue;
+      }
+      if (col == 4) {
+        if ((i64)sqlite3_column_int64(s, 4) != got1.likes) {
+          snprintf(err, n, "self-test: post %lld likes differ", ids[i]);
+          rc = -1;
+          goto out;
+        }
+        continue;
+      }
+      wp = sqlite3_column_text(s, col);
+      wantlen = sqlite3_column_bytes(s, col);
+      gp = (const u8 *)(col == 1 ? got1.body : col == 2 ? got1.created : got1.author);
+      gotlen = col == 1 ? got1.bodylen : col == 2 ? got1.createdlen : got1.authorlen;
+      if (wantlen != gotlen || memcmp(wp, gp, (size_t)wantlen) != 0) {
+        snprintf(err, n, "self-test: post %lld column %d differs", ids[i], col);
+        rc = -1;
+        goto out;
+      }
+    }
+    sqlite3_reset(s);
   }
 out:
   if (s) sqlite3_finalize(s);

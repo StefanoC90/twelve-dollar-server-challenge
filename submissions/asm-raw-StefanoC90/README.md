@@ -208,6 +208,14 @@ status codes, error strings, trimming and the 500-character limit.
   `info.nSize`, so `info.pPayload` would otherwise still describe the previous
   row. The startup self-test now also compares all 20 rows field by field
   against the SQL query and refuses the fast path on any difference.
+- **`GET /posts/:id` uses the same three cursors.** One `TableMoveto` on
+  `posts` (the id is the rowid), one on `users` for the author, and the likes
+  index from `bt_count_likes` for the count — so this endpoint has no VDBE
+  program and no bound statement either. Measured on saturated `GET
+  /posts/:id`, 8 interleaved 10 s samples each, medians: **9.95 → 9.60 µs of CPU
+  per request**. A missing id is the `TableMoveto` that lands on a neighbour, so
+  it is a 404 without touching SQL. The self-test compares this path with the
+  old `SELECT ... WHERE p.id=?` for all 20 feed ids, text and count included.
 - **SQLite settings**: `journal_mode=WAL`, `synchronous=NORMAL`,
   `busy_timeout=5000`, `cache_size=-16384` (16 MiB), `mmap_size=0`, plus
   `SQLITE_DEFAULT_WAL_SYNCHRONOUS=1` at compile time.
