@@ -49,6 +49,10 @@ sql_insert_like:
     db 'ON CONFLICT(user_id,post_id) DO NOTHING', 0
 sql_health:
     db 'SELECT 1', 0
+sql_begin:
+    db 'BEGIN', 0
+sql_commit:
+    db 'COMMIT', 0
 
 s_open_brace:   db '{'
 s_close_brace:  db '}'
@@ -65,6 +69,12 @@ section .bss
 global g_sqlite_path
 g_sqlite_path: resq 1
 
+; The pass transaction (see db_begin/db_end). One worker per process, so these
+; are process-global like the feed scratch below.
+txn_begin:  resq 1
+txn_commit: resq 1
+txn_open:   resd 1
+
 ; Feed scratch, one worker process owns these (forked before SQLite is opened).
 ; A row's text is copied out of SQLite before the next step() invalidates it.
 ; A slot holds the largest legal row: 500 characters of UTF-8 body (<= 2000 B),
@@ -80,6 +90,8 @@ section .text
 global db_init
 global db_close
 global db_health
+global db_begin
+global db_end
 global db_feed
 global db_get_post
 global db_create_post
@@ -179,6 +191,23 @@ db_init:
     call sqlite3_prepare_v2
     test eax, eax
     jnz .fail_close
+    ; the pass transaction's two statements
+    mov rdi, [r12+W_DB]
+    lea rsi, [rel sql_begin]
+    mov edx, -1
+    lea rcx, [rel txn_begin]
+    xor r8d, r8d
+    call sqlite3_prepare_v2
+    test eax, eax
+    jnz .fail_close
+    mov rdi, [r12+W_DB]
+    lea rsi, [rel sql_commit]
+    mov edx, -1
+    lea rcx, [rel txn_commit]
+    xor r8d, r8d
+    call sqlite3_prepare_v2
+    test eax, eax
+    jnz .fail_close
     xor eax, eax
     jmp .done
 .fail_close:
@@ -221,6 +250,16 @@ db_close:
     add r13, 8
     jmp .fin_loop
 .close_db:
+    mov rdi, [rel txn_begin]
+    test rdi, rdi
+    jz .fin_commit
+    call sqlite3_finalize
+.fin_commit:
+    mov rdi, [rel txn_commit]
+    test rdi, rdi
+    jz .close_real
+    call sqlite3_finalize
+.close_real:
     mov rdi, [r12+W_DB]
     test rdi, rdi
     jz .done
@@ -233,6 +272,89 @@ db_close:
     pop r12
     pop rbx
     pop rbp
+    ret
+
+; -----------------------------------------------------------------------------
+; db_begin() / db_end() - the event-loop pass's read transaction
+;
+; BEGIN is deferred, so a pass that reads nothing pays nothing (no btree
+; transaction is started until the first read). While the transaction is open
+; every read statement in the pass reuses the one read lock, which is what
+; removes the per-request fstat + two fcntl calls. db_end() is also called by
+; the write handlers before they run their INSERT: a write must not join the
+; pass's read transaction, because then its commit would be deferred to the end
+; of the pass and the 201 could leave before the commit.
+;
+; Both helpers keep every caller-saved register: they are called from the
+; event loop and from the tail of db_create_post/db_like, where eax carries a
+; return value.
+; -----------------------------------------------------------------------------
+db_begin:
+    push rax
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    push r11
+    cmp dword [rel txn_open], 0
+    jne .done
+    mov rdi, [rel txn_begin]
+    test rdi, rdi
+    jz .done
+    mov dword [rel txn_open], 1
+    call sqlite3_reset
+    mov rdi, [rel txn_begin]
+    call sqlite3_step
+    cmp eax, SQLITE_DONE
+    je .done
+    ; could not begin: leave the reads in autocommit rather than fail requests
+    mov dword [rel txn_open], 0
+    mov rdi, [rel txn_begin]
+    call sqlite3_reset
+.done:
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rax
+    ret
+
+db_end:
+    push rax
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    push r11
+    cmp dword [rel txn_open], 0
+    je .done
+    mov dword [rel txn_open], 0
+    mov rdi, [rel txn_commit]
+    call sqlite3_reset
+    mov rdi, [rel txn_commit]
+    call sqlite3_step
+    mov rdi, [rel txn_commit]
+    call sqlite3_reset
+.done:
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rax
     ret
 
 ; -----------------------------------------------------------------------------
@@ -709,6 +831,7 @@ db_create_post:
     sub rsp, 120
     mov r12, rdi
     mov r13, rsi
+    call db_end                  ; a write must not join the pass's read txn
     mov r14, [r12+W_STMT_INS]
     mov rdi, r14
     call sqlite3_reset
@@ -783,6 +906,7 @@ db_create_post:
     call sqlite3_reset
     mov eax, -1
 .out:
+    call db_begin                ; reopen the pass's read transaction
     add rsp, 120
     pop r15
     pop r14
@@ -808,6 +932,7 @@ db_like:
     mov r12, rdi
     mov r13, rsi
     mov r14, rdx
+    call db_end                  ; a write must not join the pass's read txn
     mov r15, [r12+W_STMT_EXISTS]
     mov rdi, r15
     call sqlite3_reset
@@ -868,6 +993,7 @@ db_like:
     call sqlite3_reset
     mov eax, 2
 .out:
+    call db_begin                ; reopen the pass's read transaction
     add rsp, 24
     pop r15
     pop r14

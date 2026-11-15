@@ -114,6 +114,22 @@ status codes, error strings, trimming and the 500-character limit.
   single thread with its own connection, so the per-call mutexes bought nothing;
   cross-process access is still serialised by SQLite's file locks, as WAL
   requires.
+- **One read transaction per event-loop pass.** A read statement in autocommit
+  mode is its own read transaction, and in WAL mode that costs three system
+  calls every time: `pagerPagecount()`'s `fstat` and the WAL read-lock/unlock
+  pair of `fcntl`s. `strace -c -f` under saturated `/feed` load counted **5.03
+  system calls per request, 3 of them that**. The loop now issues a deferred
+  `BEGIN` after `epoll_wait` returns a batch and a `COMMIT` when the batch is
+  served, so every read in the pass shares one read lock: **fcntl 2.00 → 0.06
+  and fstat 1.00 → 0.03 per request, 5.03 → 2.10 system calls in total**.
+  Deferred `BEGIN` starts no btree transaction, so a pass that reads nothing
+  pays nothing. A write is different: `db_create_post`/`db_like` `COMMIT` the
+  pass transaction before their `INSERT` and re-`BEGIN` after it, because a
+  write that joined the pass's read transaction would commit at the end of the
+  pass, and the 201 must not leave before its commit. The transaction never
+  outlives a pass, so a reader still sees another process's committed write on
+  its next pass. Measured on saturated `/feed`: **30.5 → 25.5 µs of CPU per
+  request** (-16 %, 32k → 37k req/s, paired runs, both orders).
 - **Feed ordered by `id`, not by `created_at`.** The feed is
   `ORDER BY p.id DESC LIMIT 20` instead of `ORDER BY p.created_at DESC,
   p.id DESC`. That is the same order for this dataset, and it lets SQLite scan
@@ -150,7 +166,8 @@ status codes, error strings, trimming and the 500-character limit.
   Every write steps the statement to `SQLITE_DONE` (committing the implicit
   transaction) before the response is written.
 - **Group commit was measured and not taken.** A like or a post is its own
-  implicit transaction today. Batching those into one transaction per event-loop
+  transaction today (the pass transaction is committed before the write). Batching
+  writes into one transaction per event-loop
   batch (allowed by rule 6 as long as each response waits for the commit) was
   costed with the real insert pattern on a copy of the seed database, 20k
   inserts, pinned: **24.9 µs per like at one commit per insert, 15.1 at two,

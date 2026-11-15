@@ -17,6 +17,8 @@ extern signal
 extern db_init
 extern db_close
 extern db_health
+extern db_begin
+extern db_end
 extern db_feed
 extern db_get_post
 extern db_create_post
@@ -490,6 +492,11 @@ event_loop:
     mov [rel g_last_sweep], rax
     call sweep_idle
 .events:
+    test r15, r15
+    jz .loop                    ; epoll_wait timed out: nothing to serve
+    ; Every read in this pass shares one SQLite read transaction (see
+    ; db_begin): 3 system calls per pass instead of 3 per request.
+    call db_begin
     ; connections first, so an accept later in this batch cannot recycle a
     ; descriptor that still has an event queued for it
     xor r14d, r14d
@@ -540,7 +547,7 @@ event_loop:
     xor r14d, r14d
 .ev2:
     cmp r14, r15
-    jae .loop
+    jae .pass_done
     lea rbx, [rel evbuf]
     lea rax, [r14+r14*2]
     shl rax, 2
@@ -552,6 +559,9 @@ event_loop:
 .ev2_next:
     inc r14
     jmp .ev2
+.pass_done:
+    call db_end
+    jmp .loop
 
 ; -----------------------------------------------------------------------------
 ; accept_new() - drain the accept queue

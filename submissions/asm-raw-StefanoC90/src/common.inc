@@ -146,6 +146,16 @@
 %define W_STMT_HEALTH       88
 %define W_SIZE              96
 
+; A read statement in autocommit mode is its own read transaction, and in WAL
+; mode that costs three system calls every time: pagerPagecount()'s fstat, the
+; WAL read-lock fcntl and its unlock fcntl. Under saturated /feed load strace
+; counts 5 system calls per request, 3 of them that. One explicit transaction
+; per event-loop pass (see db_begin/db_end) makes all the reads of the pass
+; share a single one, so the three calls are paid once per pass instead of once
+; per request. The pass is short (it is the batch epoll_wait just returned), and
+; a write commits the transaction first so an acknowledged write is still
+; committed before its response leaves.
+
 ; one rendered post
 %define R_ID                0
 %define R_BODY              8
